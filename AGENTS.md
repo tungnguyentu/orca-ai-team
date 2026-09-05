@@ -46,7 +46,8 @@ On Linux outside Orca-managed terminals, prefer `~/.local/bin/orca` (shim) over 
 | Role | Agent id | Launch |
 |------|----------|--------|
 | Orchestrator | `claude-opus` | `claude --dangerously-skip-permissions --model opus` |
-| Workers | `claude-sonnet`, `grok`, `pi`, `command-code` | see `SKILL.md` |
+| Workers (pre-opened) | `claude-sonnet`, `grok`, `pi` | see `SKILL.md` |
+| Deferred worker | `command-code` | **not** opened at `start` — spawn with `worker-start --agent command-code` |
 
 Aliases: `opus` → claude-opus; `sonnet` / `claude` → claude-sonnet.
 
@@ -108,26 +109,24 @@ orca-team reinject --orchestrator-only
 orca-team reinject
 ```
 
-## Command Code inject quirk
+## Command Code quirks (important)
 
-Command Code **rewrites its process title** after launch (e.g. `⌘ Command Code · …`). Orca agent detection then fails:
+Command Code is **hard to automate** with Orca:
 
-- `dispatch --inject` → `no recognized agent detected`
-- `worker-start --terminal <old-handle>` → `agent_unconfigured`
+1. **Onboarding race** — `worker-start --agent command-code` often returns before the ready prompt. Injected text dies on the launch banner / “Learning your coding taste”. Wait for ready markers (`Ask your question…`, `permission bypass`, `? for shortcuts`), then **one** `terminal send`.
+2. **Title rewrite** — after start it renames its process (e.g. `⌘ Command Code · …`). Orca then fails `--inject` / `--terminal` reuse with `no recognized agent` even though the TUI is live.
 
-Even though the TUI is visibly running.
+**Required recipe:**
 
-**Do this instead:**
+```bash
+orca orchestration worker-start --task <id> --worktree current --agent command-code --json
+# if prompt stalled:
+orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 180000 --json
+orca terminal read --terminal <handle> --json   # confirm ready, not onboarding
+orca terminal send --terminal <handle> --text "<task + worker_done>" --enter --json
+```
 
-1. Prefer a **fresh** supervised launch every time:
-   `orca orchestration worker-start --task <id> --worktree current --agent command-code --json`
-2. If the task is already `dispatched` to a dead/unrecognized pane:
-   - `orca orchestration dispatch-show --task <id> --json` to get `dispatch.id`
-   - `orca terminal send --terminal <cc-handle> --text "<task + worker_done instructions>" --enter --json`
-     (no `--inject`)
-3. Do **not** leave a task queued hoping the pane will magically become injectable.
-
-`orca-team` launches Command Code with `--yolo --trust --skip-onboarding` to reduce early exits to a bare shell.
+`orca-team start` therefore **does not pre-open** Command Code. Add it only via dispatch (`--workers ...,command-code` still registers it as deferred in the roster).
 
 ## Rate limits / swap orchestrator
 

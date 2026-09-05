@@ -31,7 +31,8 @@ orca-team doctor
 orca-team start --objective "Ship feature X"
 # defaults:
 #   orchestrator = claude-opus
-#   workers      = claude-sonnet,grok,pi,command-code
+#   workers      = claude-sonnet,grok,pi
+#   (command-code is deferred — spawn via worker-start --agent command-code)
 
 # Talk in the orchestrator tab inside Orca.
 orca-team status

@@ -27,7 +27,8 @@ ln -sfn "$PWD" ~/.grok/skills/orca-ai-team
 cd /path/to/orca-managed-worktree
 orca-team doctor
 orca-team start --same-tab --objective "Ship feature X"
-# defaults: orchestrator=claude-opus, workers=claude-sonnet,grok,pi,command-code
+# defaults: orchestrator=claude-opus, workers=claude-sonnet,grok,pi
+# command-code is deferred (spawn on demand via worker-start --agent command-code)
 
 orca-team status
 orca-team open

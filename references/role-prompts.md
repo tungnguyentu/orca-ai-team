@@ -69,19 +69,31 @@ Forbidden for orchestrator:
 - Do not close the worktree. Coordinate until the human says the team is done.
 - Keep card updates short: `orca worktree set --worktree current --comment "..." --json`.
 
-### If inject says “terminal still has no agent” (common with command-code)
+### command-code (and similar flaky agents)
 
-Orca `--inject` only works when the pane is a **live recognized agent TUI**, not a bare shell.
+Command Code is **deferred** in `orca-team start` (no pre-opened pane). Always spawn it fresh:
 
-Do **one** of these — do not implement the task yourself:
+```bash
+orca orchestration worker-start --task <task_id> --worktree current --agent command-code --json
+```
 
-1. **Best:** start a fresh supervised worker (ignore the dead pane):
-   `orca orchestration worker-start --task <task_id> --worktree current --agent command-code --json`
-2. **Or revive the pane**, then inject/start on that handle:
-   - `orca terminal send --terminal <handle> --text "command-code --yolo --trust --skip-onboarding" --enter --json`
-   - wait: `orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 180000 --json`
-   - then `orca orchestration worker-start --task <task_id> --worktree current --terminal <handle> --json`
-3. If the task was only queued (“will be picked up when you start command-code”), option 1 or 2 clears it — do not leave it hanging.
+Known failure modes:
+
+1. **`agent_prompt_stalled` / prompt lost during banner/onboarding**  
+   Do **not** spam resends during “Learning your coding taste” / launch banner.  
+   Wait until the ready prompt (`Ask your question…` / `permission bypass` / `? for shortcuts`), then send once:
+
+   ```bash
+   orca terminal wait --terminal <new_handle> --for tui-idle --timeout-ms 180000 --json
+   # confirm ready via: orca terminal read --terminal <new_handle> --json
+   orca terminal send --terminal <new_handle> --text "<task brief + worker_done instructions>" --enter --json
+   ```
+
+2. **`no recognized agent` / inject fails on an old Command Code pane**  
+   After start, Command Code **rewrites its process title**, so Orca stops detecting it for `--inject`.  
+   Never reuse that pane for inject. Use a **new** `worker-start --agent command-code`, or `terminal send` without `--inject`.
+
+3. Prefer other live workers (claude-sonnet / grok / pi) when Command Code keeps stalling — do not implement the task yourself.
 
 Start by acknowledging the objective, proposing a work split across the workers, then **dispatch** — do not begin implementation yourself.
 

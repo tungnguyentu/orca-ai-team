@@ -17,8 +17,27 @@ from typing import Any
 STATE_DIRNAME = ".orca"
 STATE_FILENAME = "ai-team.json"
 DEFAULT_ORCHESTRATOR = "claude-opus"
-DEFAULT_WORKERS = ["claude-sonnet", "grok", "pi", "command-code"]
+# command-code is omitted from room pre-open: it rewrites argv + runs onboarding,
+# so Orca inject/prompts often stall. Spawn it on demand via worker-start --agent.
+DEFAULT_WORKERS = ["claude-sonnet", "grok", "pi"]
+# Agents listed here are still allowed as --workers, but start() does not open a pane.
+# Orchestrator must use: worker-start --worktree current --agent <id>
+DEFERRED_AGENTS = frozenset({"command-code"})
 IDLE_TIMEOUT_MS = 180_000
+# Tail markers that mean "safe to send a prompt" (case-insensitive substring match).
+AGENT_READY_MARKERS: dict[str, tuple[str, ...]] = {
+    "command-code": (
+        "ask your question",
+        "permission bypass",
+        "? for shortcuts",
+        "❯",
+    ),
+    "claude-opus": ("bypass permissions", "❯", "※", "claude"),
+    "claude-sonnet": ("bypass permissions", "❯", "※", "claude"),
+    "claude": ("bypass permissions", "❯"),
+    "grok": ("always-approve", "grok", "❯"),
+    "pi": ("pi ready", "❯"),
+}
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 ROLE_PROMPTS_PATH = SKILL_ROOT / "references" / "role-prompts.md"
 
@@ -401,6 +420,44 @@ def ensure_claude_project_trust(worktree_path: Path) -> None:
     data["projects"] = projects
     cfg_path.write_text(json.dumps(data, indent=2) + "\n")
     print(f"  noted Claude trust for {key}")
+
+
+def wait_agent_ready(
+    orca: str,
+    handle: str,
+    *,
+    agent_id: str,
+    timeout_ms: int = 180_000,
+    poll_ms: int = 1500,
+) -> bool:
+    """Poll terminal output until agent looks ready for input (past banner/onboarding)."""
+    markers = AGENT_READY_MARKERS.get(agent_id) or AGENT_READY_MARKERS.get(
+        agent_id.split("-")[0], ()
+    )
+    # Always wait for tui-idle first, then confirm ready markers when we have them.
+    wait_tui_idle(orca, handle, timeout_ms=min(timeout_ms, 90_000))
+    if not markers:
+        return True
+    deadline = time.time() + (timeout_ms / 1000.0)
+    while time.time() < deadline:
+        text = terminal_read_tail(orca, handle).lower()
+        # Still booting / onboarding — keep waiting.
+        if any(
+            bad in text
+            for bad in (
+                "learning your coding taste",
+                "taste onboarding",
+                "do you trust the contents",
+                "quick safety check",
+            )
+        ) and not any(m.lower() in text for m in markers):
+            time.sleep(poll_ms / 1000.0)
+            continue
+        if any(m.lower() in text for m in markers):
+            return True
+        time.sleep(poll_ms / 1000.0)
+    eprint(f"warning: ready markers not seen for {agent_id} ({handle}) before timeout")
+    return False
 
 
 def dismiss_startup_prompts(orca: str, handle: str, *, agent_id: str) -> None:
@@ -854,16 +911,41 @@ def cmd_start(args: argparse.Namespace) -> int:
     run_id = run["id"]
     print(f"  run: {run_id}")
 
-    # 3) Worker terminals — new tabs, or panes in the orchestrator tab
+    # 3) Worker terminals — new tabs, or panes in the orchestrator tab.
+    # Deferred agents (e.g. command-code) are roster-only until worker-start --agent.
     split_anchor = orch_handle
-    for index, agent_id in enumerate(workers):
+    opened_index = 0
+    for agent_id in workers:
+        if agent_id in DEFERRED_AGENTS:
+            print(
+                f"  deferred worker:{agent_id} (no pane) — "
+                "orchestrator must use worker-start --agent "
+                f"{agent_id}"
+            )
+            members.append(
+                {
+                    "role": "worker",
+                    "agentId": agent_id,
+                    "title": f"worker:{agent_id}",
+                    "handle": None,
+                    "deferred": True,
+                    "launchCommand": launch_command(agent_id),
+                    "tabId": orch_tab_id,
+                    "paneKey": None,
+                    "spawnHint": (
+                        f"orca orchestration worker-start --task <task_id> "
+                        f"--worktree current --agent {agent_id} --json"
+                    ),
+                }
+            )
+            continue
+
         if layout == "split":
-            # Alternate direction after the first split so 3+ workers form a grid-ish layout.
             direction = split_direction
-            if index > 0 and split_direction == "horizontal":
-                direction = "vertical" if index % 2 == 1 else "horizontal"
-            elif index > 0 and split_direction == "vertical":
-                direction = "horizontal" if index % 2 == 1 else "vertical"
+            if opened_index > 0 and split_direction == "horizontal":
+                direction = "vertical" if opened_index % 2 == 1 else "horizontal"
+            elif opened_index > 0 and split_direction == "vertical":
+                direction = "horizontal" if opened_index % 2 == 1 else "vertical"
             term = split_terminal(
                 orca,
                 from_handle=split_anchor,
@@ -875,7 +957,6 @@ def cmd_start(args: argparse.Namespace) -> int:
                 f"  split worker:{agent_id} pane {handle} "
                 f"(same tab, {direction} from {split_anchor})"
             )
-            # Next split grows from the newest pane for a cascading layout.
             split_anchor = handle
         else:
             term = create_terminal(
@@ -889,17 +970,20 @@ def cmd_start(args: argparse.Namespace) -> int:
             terminal_rename(orca, handle, f"worker:{agent_id}")
 
         dismiss_startup_prompts(orca, handle, agent_id=agent_id)
+        wait_agent_ready(orca, handle, agent_id=agent_id)
         members.append(
             {
                 "role": "worker",
                 "agentId": agent_id,
                 "title": f"worker:{agent_id}",
                 "handle": handle,
+                "deferred": False,
                 "launchCommand": launch_command(agent_id),
                 "tabId": term.get("tabId") or orch_tab_id,
                 "paneKey": term.get("paneKey"),
             }
         )
+        opened_index += 1
 
     roster_lines = []
     for member in members:
@@ -909,8 +993,11 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
     roster = "\n".join(roster_lines) if roster_lines else "- (no workers)"
 
-    # 4) Inject role prompts
+    # 4) Inject role prompts (skip deferred workers — no pane yet)
     for member in members:
+        if member.get("deferred") or not member.get("handle"):
+            print(f"  skip role inject → {member.get('title')} (deferred)")
+            continue
         if member["role"] == "orchestrator":
             prompt = render(
                 templates["orchestrator"],
@@ -935,6 +1022,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 },
             )
         print(f"  injecting role prompt → {member['title']}")
+        wait_agent_ready(orca, member["handle"], agent_id=str(member.get("agentId") or ""))
         terminal_send(orca, member["handle"], prompt)
         # Brief pause so TUIs don't race successive injects on the same host.
         time.sleep(0.4)
@@ -945,6 +1033,60 @@ def cmd_start(args: argparse.Namespace) -> int:
         task_spec = args.task or objective
         for member in members:
             if member["role"] != "worker":
+                continue
+            if member.get("deferred") or not member.get("handle"):
+                # Deferred agents: create task only; orchestrator/worker-start opens them.
+                spec = f"[{member['agentId']}] {task_spec}"
+                task_payload = orca_json(
+                    orca,
+                    [
+                        "orchestration",
+                        "task-create",
+                        "--spec",
+                        spec,
+                        "--from",
+                        orch_handle,
+                    ],
+                )
+                task = unwrap(task_payload).get("task") or unwrap(task_payload)
+                task_id = task.get("id") or task.get("taskId")
+                start_payload = orca_json(
+                    orca,
+                    [
+                        "orchestration",
+                        "worker-start",
+                        "--task",
+                        str(task_id),
+                        "--worktree",
+                        "current",
+                        "--agent",
+                        str(member["agentId"]),
+                        "--from",
+                        orch_handle,
+                        "--run",
+                        run_id,
+                    ],
+                    check=False,
+                )
+                tasks.append(
+                    {
+                        "taskId": task_id,
+                        "agentId": member["agentId"],
+                        "handle": None,
+                        "deferred": True,
+                        "workerStartOk": bool(start_payload.get("ok")),
+                        "workerStart": unwrap(start_payload)
+                        if start_payload.get("ok")
+                        else start_payload.get("error"),
+                    }
+                )
+                if start_payload.get("ok"):
+                    print(f"  supervised deferred launch → {member['agentId']} task {task_id}")
+                else:
+                    eprint(
+                        f"warning: deferred worker-start failed for {member['agentId']}: "
+                        f"{(start_payload.get('error') or {}).get('message')}"
+                    )
                 continue
             spec = f"[{member['agentId']}] {task_spec}"
             task_payload = orca_json(
@@ -1095,9 +1237,20 @@ def build_role_prompt(
 def roster_from_members(members: list[dict[str, Any]]) -> str:
     lines = []
     for member in members:
-        if member.get("role") == "worker":
+        if member.get("role") != "worker":
+            continue
+        agent_id = member.get("agentId")
+        if member.get("deferred") or not member.get("handle"):
+            hint = member.get("spawnHint") or (
+                f"orca orchestration worker-start --task <task_id> "
+                f"--worktree current --agent {agent_id} --json"
+            )
             lines.append(
-                f"- {member.get('agentId')}: handle `{member.get('handle')}` title `{member.get('title')}`"
+                f"- {agent_id}: DEFERRED (no live pane) — spawn with `{hint}`"
+            )
+        else:
+            lines.append(
+                f"- {agent_id}: handle `{member.get('handle')}` title `{member.get('title')}`"
             )
     return "\n".join(lines) if lines else "- (no workers)"
 
