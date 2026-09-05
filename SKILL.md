@@ -91,11 +91,17 @@ Ignore leftover single tabs named `ai-team:claude` from older runs.
 
 ### Orchestrator keeps coding instead of delegating
 
-Role prompts now forbid orchestrator implementation. If Claude still does the work itself on a live team:
+Role prompts forbid orchestrator implementation. If it drifts:
 
 ```bash
 orca-team reinject --orchestrator-only
-# or reinject everyone:
+```
+
+### Workers forget to send results back
+
+Workers must always `worker_done` / `ask` / `result` — orchestrator cannot see their TUI. If they go silent:
+
+```bash
 orca-team reinject
 ```
 

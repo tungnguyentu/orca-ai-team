@@ -97,8 +97,16 @@ orca-team reinject --orchestrator-only
 ### Workers
 
 - Implement assigned scope only.
-- `ask` when blocked; one `worker_done` with `--outcome succeeded|failed` per dispatch.
+- **Always report back** — the orchestrator cannot see worker terminals.
+- `ask` when blocked; one `worker_done` with `--outcome succeeded|failed` per dispatch (also on failure).
+- For informal work without task/dispatch ids, send a final `result`/`update` via `orchestration send`.
+- Mid-task `update` if work runs more than a few minutes.
 - Do not create competing runs or become orchestrator unless told via `set-orchestrator`.
+- Silent completion is a failure mode; reinject workers if they drift:
+
+```bash
+orca-team reinject
+```
 
 ## Rate limits / swap orchestrator
 
