@@ -4,8 +4,8 @@ description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
   orchestration mail. Use when the user wants agents to talk together, an
-  orchestrator to điều phối / coordinate other AIs, "ai team", "multi agent
-  room", or `orca-team start`.
+  orchestrator to coordinate other AIs, "ai team", "multi agent room", or
+  `orca-team start`.
 ---
 
 # Orca AI Team

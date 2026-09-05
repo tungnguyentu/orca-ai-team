@@ -28,7 +28,7 @@ Installed as:
 
 ## When to use this tool
 
-Use `orca-team` when the user wants multiple coding agents (Claude / Grok / Pi / command-code / …) in one Orca worktree to talk and coordinate, with one agent điều phối (orchestrating) the others.
+Use `orca-team` when the user wants multiple coding agents (Claude / Grok / Pi / command-code / …) in one Orca worktree to talk and coordinate, with one agent orchestrating the others.
 
 Do **not** invent parallel chat paste between terminals. Prefer Orca mail + task dispatch.
 
