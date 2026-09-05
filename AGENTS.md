@@ -108,6 +108,27 @@ orca-team reinject --orchestrator-only
 orca-team reinject
 ```
 
+## Command Code inject quirk
+
+Command Code **rewrites its process title** after launch (e.g. `⌘ Command Code · …`). Orca agent detection then fails:
+
+- `dispatch --inject` → `no recognized agent detected`
+- `worker-start --terminal <old-handle>` → `agent_unconfigured`
+
+Even though the TUI is visibly running.
+
+**Do this instead:**
+
+1. Prefer a **fresh** supervised launch every time:
+   `orca orchestration worker-start --task <id> --worktree current --agent command-code --json`
+2. If the task is already `dispatched` to a dead/unrecognized pane:
+   - `orca orchestration dispatch-show --task <id> --json` to get `dispatch.id`
+   - `orca terminal send --terminal <cc-handle> --text "<task + worker_done instructions>" --enter --json`
+     (no `--inject`)
+3. Do **not** leave a task queued hoping the pane will magically become injectable.
+
+`orca-team` launches Command Code with `--yolo --trust --skip-onboarding` to reduce early exits to a bare shell.
+
 ## Rate limits / swap orchestrator
 
 Keep the same Run; demote or close the old orchestrator:

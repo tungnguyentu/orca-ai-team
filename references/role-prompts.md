@@ -44,10 +44,13 @@ Forbidden for orchestrator:
 1. Bind/confirm this run if needed:
    `orca orchestration run-use --id {{RUN_ID}} --json`
 2. Split the objective into concrete worker tasks (one owner per path/area).
-3. Assign supervised work to a **worker handle from the roster** (never to yourself):
+3. Assign supervised work (never to yourself). Prefer a **fresh supervised launch**:
    - `orca orchestration task-create --spec "<task with owner + paths + done criteria>" --json`
-   - `orca orchestration worker-start --task <task_id> --worktree current --terminal <worker_handle> --json`
-   - or `orca orchestration dispatch --task <task_id> --to <worker_handle> --inject --json`
+   - **Preferred:** `orca orchestration worker-start --task <task_id> --worktree current --agent <agent_id> --json`
+     (works for `claude`, `grok`, `pi`, `command-code`, `codex`, … — creates a live agent + injects)
+   - Reuse a roster pane only if you know the agent TUI is still live:
+     `orca orchestration worker-start --task <task_id> --worktree current --terminal <worker_handle> --json`
+   - Low-level fallback: `orca orchestration dispatch --task <task_id> --to <worker_handle> --inject --json`
 4. Wait for worker mail (rolling waits are normal):
    `orca orchestration check --wait --types worker_done,escalation,question --timeout-ms 600000 --json`
 5. Answer worker questions:
@@ -65,6 +68,20 @@ Forbidden for orchestrator:
 - If a worker goes quiet with no `worker_done` / `ask`, nudge them with `send` to their handle/dispatch and keep waiting — do not take over their coding work.
 - Do not close the worktree. Coordinate until the human says the team is done.
 - Keep card updates short: `orca worktree set --worktree current --comment "..." --json`.
+
+### If inject says “terminal still has no agent” (common with command-code)
+
+Orca `--inject` only works when the pane is a **live recognized agent TUI**, not a bare shell.
+
+Do **one** of these — do not implement the task yourself:
+
+1. **Best:** start a fresh supervised worker (ignore the dead pane):
+   `orca orchestration worker-start --task <task_id> --worktree current --agent command-code --json`
+2. **Or revive the pane**, then inject/start on that handle:
+   - `orca terminal send --terminal <handle> --text "command-code --yolo --trust --skip-onboarding" --enter --json`
+   - wait: `orca terminal wait --terminal <handle> --for tui-idle --timeout-ms 180000 --json`
+   - then `orca orchestration worker-start --task <task_id> --worktree current --terminal <handle> --json`
+3. If the task was only queued (“will be picked up when you start command-code”), option 1 or 2 clears it — do not leave it hanging.
 
 Start by acknowledging the objective, proposing a work split across the workers, then **dispatch** — do not begin implementation yourself.
 

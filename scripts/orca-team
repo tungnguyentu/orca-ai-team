@@ -32,7 +32,13 @@ AGENT_LAUNCH: dict[str, list[str]] = {
     "opus": ["claude", "--dangerously-skip-permissions", "--model", "opus"],
     "sonnet": ["claude", "--dangerously-skip-permissions", "--model", "sonnet"],
     "grok": ["grok", "--always-approve"],
-    "command-code": ["command-code", "--yolo"],
+    # --trust/--skip-onboarding keep the TUI from exiting to a bare shell before inject.
+    "command-code": [
+        "command-code",
+        "--yolo",
+        "--trust",
+        "--skip-onboarding",
+    ],
     "codex": ["codex", "--dangerously-bypass-approvals-and-sandbox"],
     "opencode": ["opencode", "--auto"],
     "pi": ["pi", "--approve"],

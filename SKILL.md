@@ -118,7 +118,7 @@ orca-team start --mode supervise --task "Implement the agreed plan" --objective 
 | `claude-opus` / `opus` | `claude --dangerously-skip-permissions --model opus` (**default orchestrator**) |
 | `claude-sonnet` / `sonnet` / `claude` | `claude --dangerously-skip-permissions --model sonnet` (**default worker**) |
 | `grok` | `grok --always-approve` |
-| `command-code` | `command-code --yolo` |
+| `command-code` | `command-code --yolo --trust --skip-onboarding` (see AGENTS.md: inject quirk after title rewrite) |
 | `codex` | `codex --dangerously-bypass-approvals-and-sandbox` |
 | `opencode` | `opencode --auto` |
 | `pi` | `pi --approve` |
