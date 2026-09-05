@@ -1,0 +1,1751 @@
+#!/usr/bin/env python3
+"""Orca AI Team launcher — multi-agent room in one Orca worktree."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+STATE_DIRNAME = ".orca"
+STATE_FILENAME = "ai-team.json"
+DEFAULT_ORCHESTRATOR = "claude-opus"
+DEFAULT_WORKERS = ["claude-sonnet", "grok", "pi", "command-code"]
+IDLE_TIMEOUT_MS = 180_000
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+ROLE_PROMPTS_PATH = SKILL_ROOT / "references" / "role-prompts.md"
+
+# Explicit argv — Orca terminal create does not expand shell aliases.
+AGENT_LAUNCH: dict[str, list[str]] = {
+    # Claude variants (orchestrator default = Opus; Sonnet is a worker)
+    "claude-opus": ["claude", "--dangerously-skip-permissions", "--model", "opus"],
+    "claude-sonnet": ["claude", "--dangerously-skip-permissions", "--model", "sonnet"],
+    # Back-compat aliases
+    "claude": ["claude", "--dangerously-skip-permissions", "--model", "sonnet"],
+    "opus": ["claude", "--dangerously-skip-permissions", "--model", "opus"],
+    "sonnet": ["claude", "--dangerously-skip-permissions", "--model", "sonnet"],
+    "grok": ["grok", "--always-approve"],
+    "command-code": ["command-code", "--yolo"],
+    "codex": ["codex", "--dangerously-bypass-approvals-and-sandbox"],
+    "opencode": ["opencode", "--auto"],
+    "pi": ["pi", "--approve"],
+}
+
+AGENT_BINARIES: dict[str, str] = {
+    "claude-opus": "claude",
+    "claude-sonnet": "claude",
+    "claude": "claude",
+    "opus": "claude",
+    "sonnet": "claude",
+    "grok": "grok",
+    "command-code": "command-code",
+    "codex": "codex",
+    "opencode": "opencode",
+    "pi": "pi",
+}
+
+
+def is_claude_agent(agent_id: str) -> bool:
+    return agent_id.startswith("claude") or agent_id in {"opus", "sonnet"}
+
+
+class TeamError(Exception):
+    pass
+
+
+def eprint(*args: Any) -> None:
+    print(*args, file=sys.stderr)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _looks_like_gnome_orca(path: str) -> bool:
+    """True when PATH `orca` is the GNOME screen reader, not the Orca IDE CLI."""
+    resolved = os.path.realpath(path)
+    if resolved in {"/usr/bin/orca", "/bin/orca"}:
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(256)
+    except OSError:
+        return False
+    # Packaged Orca CLI shims are tiny shell/python launchers mentioning orca-ide / runtime.
+    if b"GNOME" in head or b"speech" in head.lower():
+        return True
+    return False
+
+
+def resolve_orca() -> str:
+    env = os.environ.get("ORCA_CLI_COMMAND")
+    if env:
+        return env
+    if os.environ.get("ORCA_DEV_REPO_ROOT"):
+        path = shutil.which("orca-dev")
+        if path:
+            return path
+        raise TeamError("ORCA_DEV_REPO_ROOT is set but orca-dev was not found on PATH")
+
+    orca_path = shutil.which("orca")
+    # Prefer a non-GNOME `orca` shim (e.g. ~/.local/bin/orca) — it talks to the running app.
+    if orca_path and not _looks_like_gnome_orca(orca_path):
+        return orca_path
+
+    # Linux fallback: orca-ide. Avoid GNOME /usr/bin/orca.
+    if sys.platform.startswith("linux") and not os.environ.get("ORCA_TERMINAL_HANDLE"):
+        path = shutil.which("orca-ide")
+        if path:
+            return path
+        raise TeamError(
+            "No usable Orca CLI found. Install the Orca CLI shim or orca-ide "
+            "(bare /usr/bin/orca is the GNOME screen reader)."
+        )
+
+    if orca_path:
+        return orca_path
+    raise TeamError("orca CLI not found on PATH")
+
+
+def orca_json(orca: str, args: list[str], *, check: bool = True) -> dict[str, Any]:
+    cmd = [orca, *args, "--json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise TeamError(f"failed to execute {orca}: {exc}") from exc
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    # Keepalive lines are on stderr for check --wait; ignore stderr for parsing.
+    if not stdout:
+        raise TeamError(
+            f"orca returned empty JSON for {' '.join(args)}: "
+            f"{stderr or f'exit {proc.returncode}'}"
+        )
+    payload: dict[str, Any] | None = None
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        # Some commands may print multiple JSON docs; take the last object.
+        for line in reversed(stdout.splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+    if payload is None:
+        raise TeamError(f"could not parse JSON from {' '.join(args)}:\n{stdout[:1000]}")
+    if check and not payload.get("ok", True):
+        err = payload.get("error") or {}
+        code = err.get("code", "error")
+        msg = err.get("message", json.dumps(err)[:500])
+        raise TeamError(f"{code}: {msg}")
+    return payload
+
+
+def unwrap(payload: dict[str, Any]) -> Any:
+    return payload.get("result", payload)
+
+
+def launch_command(agent_id: str) -> str:
+    if agent_id not in AGENT_LAUNCH:
+        known = ", ".join(sorted(AGENT_LAUNCH))
+        raise TeamError(f"unknown agent id '{agent_id}'. Known: {known}")
+    return " ".join(AGENT_LAUNCH[agent_id])
+
+
+def binary_for(agent_id: str) -> str:
+    return AGENT_BINARIES.get(agent_id, agent_id)
+
+
+def parse_agent_list(raw: str | None, default: list[str]) -> list[str]:
+    if raw is None or raw.strip() == "":
+        return list(default)
+    agents = [part.strip() for part in raw.split(",") if part.strip()]
+    if not agents:
+        return list(default)
+    for agent in agents:
+        if agent not in AGENT_LAUNCH:
+            known = ", ".join(sorted(AGENT_LAUNCH))
+            raise TeamError(f"unknown agent id '{agent}'. Known: {known}")
+    return agents
+
+
+def find_worktree(orca: str, cwd: Path) -> dict[str, Any]:
+    payload = orca_json(orca, ["worktree", "current"], check=False)
+    if payload.get("ok"):
+        wt = unwrap(payload).get("worktree") or unwrap(payload)
+        if isinstance(wt, dict) and wt.get("path"):
+            return wt
+    # Fallback: match cwd against listed worktrees.
+    listed = orca_json(orca, ["worktree", "list"])
+    result = unwrap(listed)
+    items = result if isinstance(result, list) else result.get("worktrees") or result.get("items") or []
+    cwd_resolved = cwd.resolve()
+    for item in items:
+        path = Path(item.get("path", "")).resolve()
+        if cwd_resolved == path or path in cwd_resolved.parents or cwd_resolved in path.parents:
+            # Prefer exact / deepest containment.
+            if cwd_resolved == path or path in cwd_resolved.parents:
+                return item
+    raise TeamError(
+        f"No Orca-managed worktree contains the current directory: {cwd}\n"
+        "Open a worktree in Orca (or cd into one), then retry."
+    )
+
+
+def state_path_for(worktree_path: Path) -> Path:
+    return worktree_path / STATE_DIRNAME / STATE_FILENAME
+
+
+def load_state(worktree_path: Path) -> dict[str, Any] | None:
+    path = state_path_for(worktree_path)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise TeamError(f"corrupt team state at {path}: {exc}") from exc
+
+
+def save_state(worktree_path: Path, state: dict[str, Any]) -> Path:
+    path = state_path_for(worktree_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2) + "\n")
+    return path
+
+
+def load_role_templates() -> dict[str, str]:
+    if not ROLE_PROMPTS_PATH.is_file():
+        raise TeamError(f"missing role prompts at {ROLE_PROMPTS_PATH}")
+    text = ROLE_PROMPTS_PATH.read_text()
+    sections: dict[str, list[str]] = {"orchestrator": [], "worker": []}
+    current: str | None = None
+    for line in text.splitlines():
+        if line.strip().lower() == "## orchestrator":
+            current = "orchestrator"
+            continue
+        if line.strip().lower() == "## worker":
+            current = "worker"
+            continue
+        if current:
+            sections[current].append(line)
+    out = {k: "\n".join(v).strip() for k, v in sections.items()}
+    if not out["orchestrator"] or not out["worker"]:
+        raise TeamError("role-prompts.md missing ## Orchestrator / ## Worker sections")
+    return out
+
+
+def render(template: str, mapping: dict[str, str]) -> str:
+    out = template
+    for key, value in mapping.items():
+        out = out.replace("{{" + key + "}}", value)
+    return out
+
+
+def create_terminal(
+    orca: str,
+    *,
+    title: str,
+    command: str,
+    worktree_selector: str,
+    focus: bool = False,
+) -> dict[str, Any]:
+    """Create a terminal.
+
+    Note: Orca's ``terminal create --focus`` can time out waiting for a handle
+    on some hosts. Prefer create-without-focus, then ``terminal switch``.
+    """
+    base_args = [
+        "terminal",
+        "create",
+        "--worktree",
+        worktree_selector,
+        "--title",
+        title,
+        "--command",
+        command,
+    ]
+    # Never pass --focus on create — it races and returns
+    # runtime_error: Timed out waiting for terminal handle after creation.
+    # Auto-open is done later via terminal_switch.
+    _ = focus  # retained for API compatibility; open happens via switch
+    payload = orca_json(orca, base_args, check=False)
+    if not payload.get("ok"):
+        err = payload.get("error") or {}
+        code = err.get("code")
+        msg = err.get("message", "")
+        # One retry without any UI focus race.
+        if code == "runtime_error" and "Timed out waiting for terminal handle" in str(msg):
+            eprint("  warning: terminal create timed out; retrying once...")
+            time.sleep(1.0)
+            payload = orca_json(orca, base_args, check=False)
+        if not payload.get("ok"):
+            err = payload.get("error") or {}
+            raise TeamError(f"{err.get('code', 'error')}: {err.get('message', payload)}")
+    term = unwrap(payload).get("terminal") or unwrap(payload)
+    if not term.get("handle"):
+        raise TeamError(f"terminal create returned no handle: {json.dumps(payload)[:500]}")
+    return term
+
+
+def split_terminal(
+    orca: str,
+    *,
+    from_handle: str,
+    command: str,
+    direction: str,
+) -> dict[str, Any]:
+    """Open a new pane in the same tab as from_handle."""
+    payload = orca_json(
+        orca,
+        [
+            "terminal",
+            "split",
+            "--terminal",
+            from_handle,
+            "--direction",
+            direction,
+            "--command",
+            command,
+        ],
+    )
+    split = unwrap(payload).get("split") or unwrap(payload)
+    handle = split.get("handle")
+    if not handle:
+        raise TeamError(f"terminal split returned no handle: {json.dumps(payload)[:500]}")
+    # Normalize to the same shape as create_terminal's terminal object.
+    return {
+        "handle": handle,
+        "tabId": split.get("tabId"),
+        "paneKey": split.get("paneKey") or split.get("leafId"),
+        "leafId": split.get("leafId"),
+        "paneRuntimeId": split.get("paneRuntimeId"),
+    }
+
+
+def wait_tui_idle(orca: str, handle: str, timeout_ms: int = IDLE_TIMEOUT_MS) -> bool:
+    payload = orca_json(
+        orca,
+        [
+            "terminal",
+            "wait",
+            "--terminal",
+            handle,
+            "--for",
+            "tui-idle",
+            "--timeout-ms",
+            str(timeout_ms),
+        ],
+        check=False,
+    )
+    if payload.get("ok"):
+        return True
+    err = (payload.get("error") or {}).get("code")
+    if err == "timeout":
+        eprint(f"warning: tui-idle timeout for {handle}; continuing")
+        return False
+    raise TeamError(f"terminal wait failed for {handle}: {payload.get('error')}")
+
+
+def terminal_read_tail(orca: str, handle: str) -> str:
+    payload = orca_json(orca, ["terminal", "read", "--terminal", handle], check=False)
+    if not payload.get("ok"):
+        return ""
+    term = unwrap(payload).get("terminal") or unwrap(payload)
+    tail = term.get("tail") or []
+    if isinstance(tail, list):
+        return "\n".join(str(line) for line in tail)
+    return str(tail)
+
+
+def ensure_claude_project_trust(worktree_path: Path) -> None:
+    """Pre-accept Claude's workspace trust dialog for this path."""
+    cfg_path = Path.home() / ".claude.json"
+    if not cfg_path.is_file():
+        return
+    try:
+        data = json.loads(cfg_path.read_text())
+    except json.JSONDecodeError:
+        return
+    projects = data.setdefault("projects", {})
+    key = str(worktree_path)
+    entry = projects.get(key) or {}
+    if entry.get("hasTrustDialogAccepted"):
+        return
+    entry = {
+        **entry,
+        "allowedTools": entry.get("allowedTools", []),
+        "mcpContextUris": entry.get("mcpContextUris", []),
+        "mcpServers": entry.get("mcpServers", {}),
+        "enabledMcpjsonServers": entry.get("enabledMcpjsonServers", []),
+        "disabledMcpjsonServers": entry.get("disabledMcpjsonServers", []),
+        "hasTrustDialogAccepted": True,
+    }
+    projects[key] = entry
+    data["projects"] = projects
+    cfg_path.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"  noted Claude trust for {key}")
+
+
+def dismiss_startup_prompts(orca: str, handle: str, *, agent_id: str) -> None:
+    """Accept common first-run trust dialogs so role prompts can be delivered."""
+    wait_tui_idle(orca, handle, timeout_ms=60_000)
+    for _ in range(4):
+        text = terminal_read_tail(orca, handle).lower()
+        if not text:
+            time.sleep(0.5)
+            continue
+        needs_yes = (
+            "do you trust the contents of this directory" in text
+            or "is this a project you created or one you trust" in text
+            or "workspace trust" in text
+            or ("trust" in text and "yes, proceed" in text)
+        )
+        if needs_yes:
+            answer = "y" if agent_id in {"grok", "codex", "opencode", "pi", "command-code"} else "1"
+            # Claude's dialog is often Enter / numbered; try both styles.
+            if is_claude_agent(agent_id) and "quick safety check" in text:
+                answer = ""  # Enter alone sometimes continues; fall through to y if needed
+            print(f"  accepting trust prompt on {handle} ({agent_id})")
+            orca_json(
+                orca,
+                [
+                    "terminal",
+                    "send",
+                    "--terminal",
+                    handle,
+                    "--text",
+                    answer if answer else "y",
+                    "--enter",
+                ],
+                check=False,
+            )
+            time.sleep(1.0)
+            wait_tui_idle(orca, handle, timeout_ms=60_000)
+            continue
+        # Ready-ish agent prompt markers
+        if any(
+            marker in text
+            for marker in (
+                "❯",
+                "│ ❯",
+                "bypass permissions",
+                "always-approve",
+                "grok 4",
+                "claude code",
+                "? for shortcuts",
+            )
+        ):
+            return
+        time.sleep(0.8)
+
+
+def terminal_send(orca: str, handle: str, text: str, *, retries: int = 3) -> None:
+    last_err: str | None = None
+    for attempt in range(1, retries + 1):
+        wait_tui_idle(orca, handle, timeout_ms=90_000)
+        payload = orca_json(
+            orca,
+            [
+                "terminal",
+                "send",
+                "--terminal",
+                handle,
+                "--text",
+                text,
+                "--enter",
+            ],
+            check=False,
+        )
+        if payload.get("ok"):
+            return
+        err = payload.get("error") or {}
+        last_err = f"{err.get('code')}: {err.get('message')}"
+        if err.get("code") in {"agent_prompt_stalled", "timeout", "terminal_busy"}:
+            eprint(f"  retry send ({attempt}/{retries}) on {handle}: {last_err}")
+            time.sleep(1.5 * attempt)
+            continue
+        raise TeamError(f"terminal send failed for {handle}: {last_err}")
+    raise TeamError(f"terminal send failed for {handle} after retries: {last_err}")
+
+
+def terminal_rename(orca: str, handle: str, title: str) -> None:
+    orca_json(
+        orca,
+        ["terminal", "rename", "--terminal", handle, "--title", title],
+        check=False,
+    )
+
+
+def terminal_switch(orca: str, handle: str) -> bool:
+    """Reveal/focus a terminal tab in the Orca UI. Returns True on success."""
+    payload = orca_json(
+        orca,
+        ["terminal", "switch", "--terminal", handle],
+        check=False,
+    )
+    if payload.get("ok"):
+        return True
+    err = payload.get("error") or {}
+    eprint(
+        f"warning: could not auto-open tab for {handle}: "
+        f"{err.get('code')} {err.get('message')}"
+    )
+    return False
+
+
+def ensure_orca_app(orca: str) -> None:
+    """Make sure the Orca app/runtime is up (best-effort window reveal)."""
+    orca_json(orca, ["open"], check=False)
+
+
+def raise_orca_desktop_window() -> bool:
+    """Best-effort: bring the Orca desktop window to the foreground."""
+    # Inherit display/session vars from the running Orca app if our shell lacks them.
+    status_pid = None
+    try:
+        # Prefer the live app pid from a prior status call path via /proc scan.
+        for proc_dir in Path("/proc").iterdir():
+            if not proc_dir.name.isdigit():
+                continue
+            try:
+                cmdline = (proc_dir / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if b"/usr/lib/orca-ide/app.asar" in cmdline and b"type=renderer" not in cmdline and b"daemon-entry" not in cmdline:
+                # main electron process
+                if b"computer-sidecar" in cmdline or b"parcel-watcher" in cmdline or b"session-scanner" in cmdline:
+                    continue
+                if cmdline.startswith(b"/usr/lib/electron") and b"app.asar\x00" in cmdline:
+                    status_pid = int(proc_dir.name)
+                    break
+    except OSError:
+        status_pid = None
+
+    env = os.environ.copy()
+    if status_pid:
+        try:
+            raw = Path(f"/proc/{status_pid}/environ").read_bytes().split(b"\0")
+            for item in raw:
+                if b"=" not in item:
+                    continue
+                key, _, val = item.partition(b"=")
+                key_s = key.decode(errors="ignore")
+                if key_s in {
+                    "DISPLAY",
+                    "WAYLAND_DISPLAY",
+                    "XDG_RUNTIME_DIR",
+                    "HYPRLAND_INSTANCE_SIGNATURE",
+                    "DBUS_SESSION_BUS_ADDRESS",
+                } and key_s not in env:
+                    env[key_s] = val.decode(errors="ignore")
+        except OSError:
+            pass
+
+    # Discover Hyprland instance if still missing.
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        runtime = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        hypr_root = Path(runtime) / "hypr"
+        if hypr_root.is_dir():
+            for child in sorted(hypr_root.iterdir()):
+                if child.is_dir():
+                    env["HYPRLAND_INSTANCE_SIGNATURE"] = child.name
+                    break
+
+    # Hyprland focus by class/title.
+    if shutil.which("hyprctl"):
+        try:
+            proc = subprocess.run(
+                ["hyprctl", "clients", "-j"],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            clients = json.loads(proc.stdout or "[]")
+            target = None
+            for client in clients:
+                cls = str(client.get("class") or "")
+                title = str(client.get("title") or "")
+                pid = client.get("pid")
+                if status_pid and pid == status_pid:
+                    target = client
+                    break
+                if "orca" in cls.lower() or "orca" in title.lower():
+                    target = client
+            if target and target.get("address"):
+                subprocess.run(
+                    ["hyprctl", "dispatch", "focuswindow", f"address:{target['address']}"],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                return True
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # X11 fallback.
+    if shutil.which("xdotool") and env.get("DISPLAY"):
+        try:
+            if status_pid:
+                proc = subprocess.run(
+                    ["xdotool", "search", "--pid", str(status_pid)],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                wid = (proc.stdout or "").strip().splitlines()
+                if wid:
+                    subprocess.run(
+                        ["xdotool", "windowactivate", "--sync", wid[0]],
+                        capture_output=True,
+                        text=True,
+                        env=env,
+                        check=False,
+                    )
+                    return True
+            proc = subprocess.run(
+                ["xdotool", "search", "--name", "Orca"],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            wid = (proc.stdout or "").strip().splitlines()
+            if wid:
+                subprocess.run(
+                    ["xdotool", "windowactivate", "--sync", wid[0]],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def print_remote_open_help(*, worktree_path: Path, tab_title: str) -> None:
+    """Explain how to find the team when viewing via Orca remote from another machine."""
+    print("  remote viewer:")
+    print(f"    1. On the remote Orca client, open worktree card: {worktree_path.name}")
+    print(f"       path: {worktree_path}")
+    print(f"    2. In that worktree's terminal strip, click tab titled exactly: {tab_title}")
+    print("    3. You should see split panes (orchestrator + workers)")
+    print("    note: `terminal switch` focuses the HOST Orca UI; remote viewers must")
+    print("    select the worktree + tab manually (focus does not mirror over remote).")
+
+
+def reveal_team_tab(
+    orca: str,
+    handle: str,
+    *,
+    tab_title: str = "ai-team",
+    worktree_path: Path | None = None,
+) -> bool:
+    """Ensure Orca is up, keep a stable tab title, switch to it, raise the window."""
+    ensure_orca_app(orca)
+    # Agents overwrite tab titles with their own TUI titles — re-stamp before switch.
+    terminal_rename(orca, handle, tab_title)
+    time.sleep(0.2)
+    ok = terminal_switch(orca, handle)
+    raised = raise_orca_desktop_window()
+    # Second switch after raise helps when the window was on another workspace.
+    time.sleep(0.2)
+    ok = terminal_switch(orca, handle) or ok
+    terminal_rename(orca, handle, tab_title)
+    if ok:
+        print(f"  focused HOST tab titled exactly: {tab_title}")
+        if raised:
+            print("  raised HOST Orca desktop window")
+        else:
+            print("  tip: on the host machine, click the Orca window if it stayed in background")
+        print(f"  tip: ignore leftover single tabs named 'ai-team:claude' — use '{tab_title}'")
+    if worktree_path is not None:
+        print_remote_open_help(worktree_path=worktree_path, tab_title=tab_title)
+    return ok
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    problems: list[str] = []
+    print("orca-team doctor")
+    try:
+        orca = resolve_orca()
+        print(f"  orca cli: {orca}")
+    except TeamError as exc:
+        print(f"  orca cli: FAIL ({exc})")
+        return 1
+
+    status = orca_json(orca, ["status"], check=False)
+    if not status.get("ok"):
+        problems.append(f"status not ok: {status.get('error')}")
+        print("  runtime: FAIL")
+    else:
+        result = unwrap(status)
+        runtime = result.get("runtime") or {}
+        app = result.get("app") or {}
+        print(
+            f"  runtime: {runtime.get('state')} reachable={runtime.get('reachable')} "
+            f"app_running={app.get('running')} version={runtime.get('appVersion')}"
+        )
+        if runtime.get("state") != "ready" or not runtime.get("reachable"):
+            problems.append("Orca runtime is not ready")
+        caps = runtime.get("capabilities") or []
+        orch_caps = [c for c in caps if "orchestration" in c]
+        print(f"  orchestration caps: {len(orch_caps)} ({', '.join(orch_caps[:4])}{'...' if len(orch_caps) > 4 else ''})")
+        if not orch_caps:
+            problems.append(
+                "No orchestration capabilities reported. Enable Settings → Experimental → orchestration."
+            )
+
+    cwd = Path.cwd()
+    try:
+        wt = find_worktree(orca, cwd)
+        print(f"  worktree: {wt.get('displayName')} @ {wt.get('path')}")
+    except TeamError as exc:
+        print(f"  worktree: FAIL ({exc})")
+        problems.append(str(exc))
+
+    print("  agents:")
+    printed: set[str] = set()
+    show_ids = [DEFAULT_ORCHESTRATOR, *DEFAULT_WORKERS]
+    for agent_id in sorted(AGENT_LAUNCH):
+        if agent_id in {"claude", "opus", "sonnet"}:
+            continue
+        if agent_id not in show_ids:
+            show_ids.append(agent_id)
+    for agent_id in show_ids:
+        if agent_id in printed:
+            continue
+        printed.add(agent_id)
+        binary = binary_for(agent_id)
+        path = shutil.which(binary)
+        launch = launch_command(agent_id)
+        if path:
+            print(f"    {agent_id}: OK ({path}) → `{launch}`")
+        else:
+            mark = "WARN" if agent_id not in (DEFAULT_ORCHESTRATOR, *DEFAULT_WORKERS) else "FAIL"
+            print(f"    {agent_id}: {mark} (binary '{binary}' not on PATH)")
+            if agent_id in (DEFAULT_ORCHESTRATOR, *DEFAULT_WORKERS):
+                problems.append(f"missing default agent binary: {binary}")
+
+    # Probe orchestration binding requirement with a no-op list.
+    probe = orca_json(orca, ["orchestration", "run-list"], check=False)
+    if not probe.get("ok"):
+        err = probe.get("error") or {}
+        print(f"  orchestration run-list: FAIL ({err.get('code')}: {err.get('message')})")
+        problems.append(
+            "orchestration commands failed — enable Experimental orchestration in Orca settings"
+        )
+    else:
+        print("  orchestration run-list: OK")
+
+    if problems:
+        print("\nProblems:")
+        for item in problems:
+            print(f"  - {item}")
+        return 1
+    print("\nAll checks passed.")
+    return 0
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    worktree_id = wt.get("id") or f"path:{worktree_path}"
+    selector = f"path:{worktree_path}"
+
+    existing = load_state(worktree_path)
+    if existing and existing.get("status") == "running" and not args.force:
+        raise TeamError(
+            f"team already running in {worktree_path} (run {existing.get('runId')}).\n"
+            "Use `orca-team status`, `orca-team stop`, or pass --force."
+        )
+
+    orchestrator = args.orchestrator
+    workers = parse_agent_list(args.workers, DEFAULT_WORKERS)
+    if orchestrator in workers:
+        workers = [w for w in workers if w != orchestrator]
+    objective = args.objective or "Coordinate the AI team on the current worktree objective"
+
+    # Ensure binaries exist for requested agents.
+    for agent_id in [orchestrator, *workers]:
+        binary = binary_for(agent_id)
+        if not shutil.which(binary):
+            raise TeamError(f"agent binary not found on PATH: {binary} (id={agent_id})")
+
+    templates = load_role_templates()
+    members: list[dict[str, Any]] = []
+
+    layout = "split" if getattr(args, "same_tab", False) else args.layout
+    split_direction = args.split_direction
+
+    print(f"Starting AI team in {worktree_path}")
+    print(f"  orchestrator: {orchestrator} → `{launch_command(orchestrator)}`")
+    print(f"  workers: {', '.join(workers) if workers else '(none)'}")
+    print(f"  layout: {layout}" + (f" ({split_direction})" if layout == "split" else ""))
+    print(f"  objective: {objective}")
+
+    if is_claude_agent(orchestrator) or any(is_claude_agent(w) for w in workers):
+        ensure_claude_project_trust(worktree_path)
+
+    # 1) Orchestrator terminal (always a new tab — workers may join as splits)
+    # Keep a stable short title. Agent TUIs overwrite longer titles and confuse auto-open.
+    tab_title = "ai-team" if layout == "split" else f"orchestrator:{orchestrator}"
+    open_tab = not getattr(args, "no_open", False)
+    orch_term = create_terminal(
+        orca,
+        title=tab_title,
+        command=launch_command(orchestrator),
+        worktree_selector=selector,
+        focus=False,
+    )
+    orch_handle = orch_term["handle"]
+    orch_tab_id = orch_term.get("tabId")
+    print(f"  created orchestrator terminal {orch_handle}")
+    dismiss_startup_prompts(orca, orch_handle, agent_id=orchestrator)
+    terminal_rename(orca, orch_handle, tab_title)
+    members.append(
+        {
+            "role": "orchestrator",
+            "agentId": orchestrator,
+            "title": f"orchestrator:{orchestrator}",
+            "handle": orch_handle,
+            "launchCommand": launch_command(orchestrator),
+            "tabId": orch_tab_id,
+            "paneKey": orch_term.get("paneKey"),
+        }
+    )
+
+    # 2) Bind run to orchestrator
+    run_payload = orca_json(
+        orca,
+        [
+            "orchestration",
+            "run-create",
+            "--objective",
+            objective,
+            "--from",
+            orch_handle,
+        ],
+    )
+    run = unwrap(run_payload).get("run") or unwrap(run_payload)
+    run_id = run["id"]
+    print(f"  run: {run_id}")
+
+    # 3) Worker terminals — new tabs, or panes in the orchestrator tab
+    split_anchor = orch_handle
+    for index, agent_id in enumerate(workers):
+        if layout == "split":
+            # Alternate direction after the first split so 3+ workers form a grid-ish layout.
+            direction = split_direction
+            if index > 0 and split_direction == "horizontal":
+                direction = "vertical" if index % 2 == 1 else "horizontal"
+            elif index > 0 and split_direction == "vertical":
+                direction = "horizontal" if index % 2 == 1 else "vertical"
+            term = split_terminal(
+                orca,
+                from_handle=split_anchor,
+                command=launch_command(agent_id),
+                direction=direction,
+            )
+            handle = term["handle"]
+            print(
+                f"  split worker:{agent_id} pane {handle} "
+                f"(same tab, {direction} from {split_anchor})"
+            )
+            # Next split grows from the newest pane for a cascading layout.
+            split_anchor = handle
+        else:
+            term = create_terminal(
+                orca,
+                title=f"worker:{agent_id}",
+                command=launch_command(agent_id),
+                worktree_selector=selector,
+            )
+            handle = term["handle"]
+            print(f"  created worker:{agent_id} terminal {handle}")
+            terminal_rename(orca, handle, f"worker:{agent_id}")
+
+        dismiss_startup_prompts(orca, handle, agent_id=agent_id)
+        members.append(
+            {
+                "role": "worker",
+                "agentId": agent_id,
+                "title": f"worker:{agent_id}",
+                "handle": handle,
+                "launchCommand": launch_command(agent_id),
+                "tabId": term.get("tabId") or orch_tab_id,
+                "paneKey": term.get("paneKey"),
+            }
+        )
+
+    roster_lines = []
+    for member in members:
+        if member["role"] == "worker":
+            roster_lines.append(
+                f"- {member['agentId']}: handle `{member['handle']}` title `{member['title']}`"
+            )
+    roster = "\n".join(roster_lines) if roster_lines else "- (no workers)"
+
+    # 4) Inject role prompts
+    for member in members:
+        if member["role"] == "orchestrator":
+            prompt = render(
+                templates["orchestrator"],
+                {
+                    "RUN_ID": run_id,
+                    "OBJECTIVE": objective,
+                    "WORKTREE_PATH": str(worktree_path),
+                    "ORCHESTRATOR_HANDLE": orch_handle,
+                    "ROSTER": roster,
+                },
+            )
+        else:
+            prompt = render(
+                templates["worker"],
+                {
+                    "RUN_ID": run_id,
+                    "OBJECTIVE": objective,
+                    "WORKTREE_PATH": str(worktree_path),
+                    "AGENT_ID": member["agentId"],
+                    "WORKER_HANDLE": member["handle"],
+                    "ORCHESTRATOR_HANDLE": orch_handle,
+                },
+            )
+        print(f"  injecting role prompt → {member['title']}")
+        terminal_send(orca, member["handle"], prompt)
+        # Brief pause so TUIs don't race successive injects on the same host.
+        time.sleep(0.4)
+
+    # Optional supervise mode: create one umbrella task per worker.
+    tasks: list[dict[str, Any]] = []
+    if args.mode == "supervise":
+        task_spec = args.task or objective
+        for member in members:
+            if member["role"] != "worker":
+                continue
+            spec = f"[{member['agentId']}] {task_spec}"
+            task_payload = orca_json(
+                orca,
+                [
+                    "orchestration",
+                    "task-create",
+                    "--spec",
+                    spec,
+                    "--from",
+                    orch_handle,
+                ],
+            )
+            task = unwrap(task_payload).get("task") or unwrap(task_payload)
+            task_id = task.get("id") or task.get("taskId")
+            if not task_id:
+                raise TeamError(f"task-create missing id: {json.dumps(task_payload)[:500]}")
+            start_payload = orca_json(
+                orca,
+                [
+                    "orchestration",
+                    "worker-start",
+                    "--task",
+                    task_id,
+                    "--worktree",
+                    "current",
+                    "--terminal",
+                    member["handle"],
+                    "--from",
+                    orch_handle,
+                    "--run",
+                    run_id,
+                ],
+                check=False,
+            )
+            tasks.append(
+                {
+                    "taskId": task_id,
+                    "agentId": member["agentId"],
+                    "handle": member["handle"],
+                    "workerStartOk": bool(start_payload.get("ok")),
+                    "workerStart": unwrap(start_payload) if start_payload.get("ok") else start_payload.get("error"),
+                }
+            )
+            if start_payload.get("ok"):
+                print(f"  supervised dispatch → {member['agentId']} task {task_id}")
+            else:
+                eprint(
+                    f"warning: worker-start failed for {member['agentId']}: "
+                    f"{(start_payload.get('error') or {}).get('message')}"
+                )
+
+    state = {
+        "version": 1,
+        "status": "running",
+        "startedAt": utc_now(),
+        "mode": args.mode,
+        "layout": layout,
+        "splitDirection": split_direction if layout == "split" else None,
+        "objective": objective,
+        "runId": run_id,
+        "worktreeId": worktree_id,
+        "worktreePath": str(worktree_path),
+        "orcaCli": orca,
+        "members": members,
+        "tasks": tasks,
+    }
+    path = save_state(worktree_path, state)
+
+    # Best-effort worktree comment — visible on remote worktree cards.
+    try:
+        orca_json(
+            orca,
+            [
+                "worktree",
+                "set",
+                "--worktree",
+                selector,
+                "--comment",
+                f'ai-team LIVE — open terminal tab "{tab_title}" ({orchestrator}+{len(workers)}, {layout})',
+            ],
+            check=False,
+        )
+    except TeamError:
+        pass
+
+    if open_tab:
+        if not reveal_team_tab(
+            orca,
+            orch_handle,
+            tab_title=tab_title,
+            worktree_path=worktree_path,
+        ):
+            print(
+                f"  tip: run `orca-team open` or "
+                f"`orca terminal switch --terminal {orch_handle} --json`"
+            )
+            print_remote_open_help(worktree_path=worktree_path, tab_title=tab_title)
+
+    print("\nTeam ready.")
+    print(f"  runId:    {run_id}")
+    print(f"  layout:   {layout}")
+    print(f"  state:    {path}")
+    if layout == "split":
+        print(f"  next:     open worktree + tab '{tab_title}' (split panes: all agents)")
+    else:
+        print(f"  next:     talk to tab orchestrator:{orchestrator}")
+    print("  open:     orca-team open   # host focus + remote instructions")
+    print("  status:   orca-team status")
+    print("  stop:     orca-team stop")
+    return 0
+
+
+def build_role_prompt(
+    *,
+    templates: dict[str, str],
+    member: dict[str, Any],
+    run_id: str,
+    objective: str,
+    worktree_path: Path,
+    orch_handle: str,
+    roster: str,
+) -> str:
+    if member.get("role") == "orchestrator":
+        return render(
+            templates["orchestrator"],
+            {
+                "RUN_ID": run_id,
+                "OBJECTIVE": objective,
+                "WORKTREE_PATH": str(worktree_path),
+                "ORCHESTRATOR_HANDLE": orch_handle,
+                "ROSTER": roster,
+            },
+        )
+    return render(
+        templates["worker"],
+        {
+            "RUN_ID": run_id,
+            "OBJECTIVE": objective,
+            "WORKTREE_PATH": str(worktree_path),
+            "AGENT_ID": str(member.get("agentId") or "worker"),
+            "WORKER_HANDLE": str(member.get("handle") or ""),
+            "ORCHESTRATOR_HANDLE": orch_handle,
+        },
+    )
+
+
+def roster_from_members(members: list[dict[str, Any]]) -> str:
+    lines = []
+    for member in members:
+        if member.get("role") == "worker":
+            lines.append(
+                f"- {member.get('agentId')}: handle `{member.get('handle')}` title `{member.get('title')}`"
+            )
+    return "\n".join(lines) if lines else "- (no workers)"
+
+
+def cmd_open(args: argparse.Namespace) -> int:
+    """Focus the running team tab in the Orca UI (and raise the app window)."""
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state:
+        raise TeamError("no ai-team state; run orca-team start first")
+    orch = next((m for m in state.get("members") or [] if m.get("role") == "orchestrator"), None)
+    if not orch or not orch.get("handle"):
+        raise TeamError("team state missing orchestrator handle")
+    layout = state.get("layout") or "tabs"
+    tab_title = "ai-team" if layout == "split" else f"orchestrator:{orch.get('agentId', 'agent')}"
+    # Refresh card comment for remote findability.
+    try:
+        orca_json(
+            orca,
+            [
+                "worktree",
+                "set",
+                "--worktree",
+                f"path:{worktree_path}",
+                "--comment",
+                f'ai-team LIVE — open terminal tab "{tab_title}"',
+            ],
+            check=False,
+        )
+    except TeamError:
+        pass
+    if not reveal_team_tab(
+        orca,
+        orch["handle"],
+        tab_title=tab_title,
+        worktree_path=worktree_path,
+    ):
+        raise TeamError(f"could not open team tab ({orch['handle']})")
+    print(f"Host focused run {state.get('runId')} → tab '{tab_title}'")
+    return 0
+
+
+def reinject_roles(
+    orca: str,
+    *,
+    state: dict[str, Any],
+    worktree_path: Path,
+    targets: list[dict[str, Any]] | None = None,
+    orchestrator_prefix: str | None = None,
+) -> None:
+    members = list(state.get("members") or [])
+    orch = next((m for m in members if m.get("role") == "orchestrator"), None)
+    if not orch or not orch.get("handle"):
+        raise TeamError("team state missing orchestrator")
+    run_id = str(state.get("runId") or "")
+    objective = str(state.get("objective") or "")
+    templates = load_role_templates()
+    roster = roster_from_members(members)
+    selected = targets if targets is not None else members
+
+    for member in selected:
+        handle = member.get("handle")
+        if not handle:
+            continue
+        prompt = build_role_prompt(
+            templates=templates,
+            member=member,
+            run_id=run_id,
+            objective=objective,
+            worktree_path=worktree_path,
+            orch_handle=str(orch["handle"]),
+            roster=roster,
+        )
+        if member.get("role") == "orchestrator" and orchestrator_prefix:
+            prompt = orchestrator_prefix + "\n\n" + prompt
+        elif member.get("role") == "orchestrator":
+            prompt = (
+                "CORRECTION: You drifted into doing implementation yourself. "
+                "Stop coding. You are orchestrator-only — delegate with task-create + "
+                "worker-start/dispatch to the worker roster, then wait on worker_done/ask.\n\n"
+                + prompt
+            )
+        print(f"  reinjecting → {member.get('title') or member.get('agentId')}")
+        terminal_send(orca, handle, prompt)
+        time.sleep(0.4)
+
+    orca_json(
+        orca,
+        [
+            "orchestration",
+            "send",
+            "--from",
+            str(orch["handle"]),
+            "--run",
+            run_id,
+            "--to",
+            f"run:{run_id}",
+            "--subject",
+            "team roster / policy update",
+            "--body",
+            "Orchestrator must not implement. Workers own coding tasks. "
+            f"Current orchestrator handle: {orch['handle']} ({orch.get('agentId')}).",
+        ],
+        check=False,
+    )
+
+
+def cmd_reinject(args: argparse.Namespace) -> int:
+    """Re-send role prompts to the live team (fix orchestrator drift into coding)."""
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state or state.get("status") != "running":
+        raise TeamError("no running ai-team; start a team first")
+    members = list(state.get("members") or [])
+    orch = next((m for m in members if m.get("role") == "orchestrator"), None)
+    if not orch:
+        raise TeamError("team state missing orchestrator")
+    targets = [orch] if args.orchestrator_only else members
+    reinject_roles(orca, state=state, worktree_path=worktree_path, targets=targets)
+    print("Reinjected role prompts.")
+    return 0
+
+
+def cmd_set_orchestrator(args: argparse.Namespace) -> int:
+    """Replace the orchestrator (rate-limit / model swap) while keeping the same Run."""
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    selector = f"path:{worktree_path}"
+    state = load_state(worktree_path)
+    if not state or state.get("status") != "running":
+        raise TeamError("no running ai-team; start a team first")
+
+    run_id = str(state.get("runId") or "")
+    if not run_id:
+        raise TeamError("team state missing runId")
+
+    new_agent = args.agent
+    if new_agent not in AGENT_LAUNCH:
+        raise TeamError(f"unknown agent id '{new_agent}'")
+    if not shutil.which(binary_for(new_agent)):
+        raise TeamError(f"agent binary not found on PATH: {binary_for(new_agent)}")
+
+    members = list(state.get("members") or [])
+    old_orch = next((m for m in members if m.get("role") == "orchestrator"), None)
+    if not old_orch:
+        raise TeamError("team state missing current orchestrator")
+
+    layout = state.get("layout") or "tabs"
+    split_direction = state.get("splitDirection") or "horizontal"
+    reason = args.reason or "orchestrator swap (limit / model change)"
+
+    print(f"Changing orchestrator → {new_agent} ({reason})")
+    print(f"  previous: {old_orch.get('agentId')} handle={old_orch.get('handle')}")
+
+    if is_claude_agent(new_agent):
+        ensure_claude_project_trust(worktree_path)
+
+    # Prefer promoting an existing live worker with the same agent id.
+    promote = None
+    if not args.fresh:
+        for member in members:
+            if (
+                member.get("role") == "worker"
+                and member.get("agentId") == new_agent
+                and member.get("handle")
+            ):
+                promote = member
+                break
+
+    if promote:
+        new_handle = str(promote["handle"])
+        print(f"  promoting existing worker pane {new_handle}")
+        new_member = {
+            **promote,
+            "role": "orchestrator",
+            "title": f"orchestrator:{new_agent}",
+            "agentId": new_agent,
+        }
+    else:
+        # Spawn a fresh orchestrator pane/tab.
+        if layout == "split" and old_orch.get("handle"):
+            term = split_terminal(
+                orca,
+                from_handle=str(old_orch["handle"]),
+                command=launch_command(new_agent),
+                direction=str(split_direction),
+            )
+            print(f"  split new orchestrator pane {term['handle']}")
+        else:
+            term = create_terminal(
+                orca,
+                title=f"orchestrator:{new_agent}",
+                command=launch_command(new_agent),
+                worktree_selector=selector,
+            )
+            print(f"  created new orchestrator terminal {term['handle']}")
+        new_handle = str(term["handle"])
+        dismiss_startup_prompts(orca, new_handle, agent_id=new_agent)
+        new_member = {
+            "role": "orchestrator",
+            "agentId": new_agent,
+            "title": f"orchestrator:{new_agent}",
+            "handle": new_handle,
+            "launchCommand": launch_command(new_agent),
+            "tabId": term.get("tabId") or old_orch.get("tabId"),
+            "paneKey": term.get("paneKey"),
+        }
+
+    # Bind the existing Run to the new coordinator terminal.
+    bind = orca_json(
+        orca,
+        [
+            "orchestration",
+            "run-use",
+            "--id",
+            run_id,
+            "--from",
+            new_handle,
+        ],
+        check=False,
+    )
+    if not bind.get("ok"):
+        # Fallback: some runtimes only accept bind from inside the pane; try create is wrong.
+        err = bind.get("error") or {}
+        raise TeamError(
+            f"failed to bind run {run_id} to new orchestrator: "
+            f"{err.get('code')} {err.get('message')}"
+        )
+    print(f"  bound run {run_id} → {new_handle}")
+
+    # Rebuild member list: demote old orchestrator, drop promoted worker row if any.
+    updated: list[dict[str, Any]] = []
+    for member in members:
+        if member is old_orch or member.get("handle") == old_orch.get("handle"):
+            if args.close_old:
+                continue
+            demoted = {
+                **member,
+                "role": "worker",
+                "title": f"worker:{member.get('agentId')}-standby",
+                "standbyReason": reason,
+                "wasOrchestrator": True,
+            }
+            updated.append(demoted)
+            continue
+        if promote and member.get("handle") == promote.get("handle"):
+            continue
+        updated.append(member)
+    updated.insert(0, new_member)
+
+    state["members"] = updated
+    state["orchestratorHistory"] = list(state.get("orchestratorHistory") or []) + [
+        {
+            "at": utc_now(),
+            "fromAgentId": old_orch.get("agentId"),
+            "fromHandle": old_orch.get("handle"),
+            "toAgentId": new_agent,
+            "toHandle": new_handle,
+            "reason": reason,
+        }
+    ]
+    save_state(worktree_path, state)
+
+    if args.close_old and old_orch.get("handle"):
+        # In split layout closing with --tab would kill everyone; close pane only.
+        close_args = ["terminal", "close", "--terminal", str(old_orch["handle"])]
+        if layout != "split":
+            # Old orchestrator was its own tab only in tabs layout when alone — still avoid --tab
+            # if workers may share? In tabs layout each agent is its own tab, so --tab is OK.
+            close_args.append("--tab")
+        payload = orca_json(orca, close_args, check=False)
+        if payload.get("ok"):
+            print(f"  closed previous orchestrator {old_orch.get('handle')}")
+        else:
+            eprint(f"  warning: could not close old orchestrator: {payload.get('error')}")
+
+    prefix = (
+        f"You are the NEW orchestrator for run {run_id} after a swap ({reason}). "
+        f"Previous orchestrator was {old_orch.get('agentId')} ({old_orch.get('handle')}). "
+        "Continue coordinating — do not re-implement finished worker work. "
+        "Delegate with task-create + worker-start/dispatch."
+    )
+    reinject_roles(
+        orca,
+        state=state,
+        worktree_path=worktree_path,
+        orchestrator_prefix=prefix,
+    )
+
+    # Notify old orchestrator explicitly if kept.
+    if not args.close_old and old_orch.get("handle"):
+        terminal_send(
+            orca,
+            str(old_orch["handle"]),
+            (
+                f"NOTICE: You are no longer the orchestrator ({reason}). "
+                f"New orchestrator is {new_agent} handle `{new_handle}`. "
+                "Stand by as a worker. Do not create competing runs. "
+                "Wait for dispatched tasks or human instructions."
+            ),
+        )
+
+    tab_title = "ai-team" if layout == "split" else f"orchestrator:{new_agent}"
+    terminal_rename(orca, new_handle, tab_title)
+    if not args.no_open:
+        reveal_team_tab(orca, new_handle, tab_title=tab_title, worktree_path=worktree_path)
+
+    try:
+        orca_json(
+            orca,
+            [
+                "worktree",
+                "set",
+                "--worktree",
+                selector,
+                "--comment",
+                f'ai-team LIVE — orchestrator={new_agent} tab "{tab_title}"',
+            ],
+            check=False,
+        )
+    except TeamError:
+        pass
+
+    print(f"Orchestrator is now {new_agent} ({new_handle}) for run {run_id}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state:
+        print(f"No ai-team state in {worktree_path / STATE_DIRNAME / STATE_FILENAME}")
+        return 1
+
+    print(f"AI team @ {worktree_path}")
+    print(f"  status:    {state.get('status')}")
+    print(f"  mode:      {state.get('mode')}")
+    print(f"  layout:    {state.get('layout', 'tabs')}")
+    print(f"  runId:     {state.get('runId')}")
+    print(f"  objective: {state.get('objective')}")
+    print(f"  startedAt: {state.get('startedAt')}")
+    print("  members:")
+    live = orca_json(
+        orca,
+        ["terminal", "list", "--worktree", f"path:{worktree_path}"],
+        check=False,
+    )
+    live_handles: set[str] = set()
+    if live.get("ok"):
+        result = unwrap(live)
+        terms = result.get("terminals") or result.get("items") or result
+        if isinstance(terms, list):
+            for term in terms:
+                handle = term.get("handle")
+                if handle:
+                    live_handles.add(handle)
+
+    for member in state.get("members") or []:
+        handle = member.get("handle")
+        presence = "live" if handle in live_handles else ("unknown" if not live.get("ok") else "missing")
+        print(
+            f"    - {member.get('role')}:{member.get('agentId')} "
+            f"handle={handle} [{presence}]"
+        )
+
+    if state.get("runId"):
+        inbox = orca_json(
+            orca,
+            ["orchestration", "inbox", "--limit", "10"],
+            check=False,
+        )
+        if inbox.get("ok"):
+            messages = unwrap(inbox).get("messages") or unwrap(inbox).get("items") or []
+            if isinstance(messages, list):
+                print(f"  inbox sample: {len(messages)} message(s)")
+            else:
+                print("  inbox: ok")
+        else:
+            err = inbox.get("error") or {}
+            print(f"  inbox: unavailable ({err.get('code', 'error')})")
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state or not state.get("runId"):
+        raise TeamError("no running ai-team state with runId; run orca-team start first")
+
+    run_id = state["runId"]
+    orch = next((m for m in state.get("members") or [] if m.get("role") == "orchestrator"), None)
+    if not orch:
+        raise TeamError("team state missing orchestrator member")
+
+    to = args.to
+    if to in ("run", "team", "@run"):
+        to = f"run:{run_id}"
+    elif to.startswith("worker:"):
+        agent_id = to.split(":", 1)[1]
+        match = next(
+            (
+                m
+                for m in state.get("members") or []
+                if m.get("role") == "worker" and m.get("agentId") == agent_id
+            ),
+            None,
+        )
+        if not match:
+            raise TeamError(f"no worker named {agent_id} in team state")
+        to = match["handle"]
+
+    cmd = [
+        "orchestration",
+        "send",
+        "--subject",
+        args.subject,
+        "--body",
+        args.body,
+        "--from",
+        orch["handle"],
+        "--run",
+        run_id,
+        "--to",
+        to,
+    ]
+    if args.type:
+        cmd.extend(["--type", args.type])
+    payload = orca_json(orca, cmd)
+    print(json.dumps(unwrap(payload), indent=2))
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state:
+        raise TeamError("no ai-team state to stop")
+
+    closed = []
+    errors = []
+    layout = state.get("layout") or "tabs"
+    members = list(state.get("members") or [])
+
+    # Same-tab layout: one --tab close removes every pane. Avoid closing N times.
+    if layout == "split" and not args.keep_orchestrator:
+        orch = next((m for m in members if m.get("role") == "orchestrator"), None)
+        target = orch or (members[0] if members else None)
+        if target and target.get("handle"):
+            payload = orca_json(
+                orca,
+                ["terminal", "close", "--terminal", target["handle"], "--tab"],
+                check=False,
+            )
+            if payload.get("ok"):
+                closed.append(target["handle"])
+                print(f"  closed shared team tab via {target.get('title')} ({target['handle']})")
+            else:
+                err = payload.get("error") or {}
+                errors.append(f"{target['handle']}: {err.get('code')} {err.get('message')}")
+                eprint(f"  warning: could not close team tab: {err.get('message')}")
+        members = []  # skip per-pane loop
+
+    for member in members:
+        handle = member.get("handle")
+        if not handle:
+            continue
+        if args.keep_orchestrator and member.get("role") == "orchestrator":
+            continue
+        # In split+keep-orchestrator, close only worker panes (no --tab).
+        close_args = ["terminal", "close", "--terminal", handle]
+        if layout != "split":
+            close_args.append("--tab")
+        payload = orca_json(orca, close_args, check=False)
+        if payload.get("ok"):
+            closed.append(handle)
+            print(f"  closed {member.get('title')} ({handle})")
+        else:
+            err = payload.get("error") or {}
+            errors.append(f"{handle}: {err.get('code')} {err.get('message')}")
+            eprint(f"  warning: could not close {handle}: {err.get('message')}")
+
+    state["status"] = "stopped"
+    state["stoppedAt"] = utc_now()
+    state["closedHandles"] = closed
+    save_state(worktree_path, state)
+
+    try:
+        orca_json(
+            orca,
+            [
+                "worktree",
+                "set",
+                "--worktree",
+                f"path:{worktree_path}",
+                "--comment",
+                "ai-team stopped",
+            ],
+            check=False,
+        )
+    except TeamError:
+        pass
+
+    print(f"Stopped team run {state.get('runId')} (closed {len(closed)} tab(s)).")
+    if errors and not closed:
+        return 1
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="orca-team",
+        description="Open a multi-agent Orca team room (orchestrator + workers) in the current worktree.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    doctor = sub.add_parser("doctor", help="Check Orca runtime, orchestration, and agent binaries")
+    doctor.set_defaults(func=cmd_doctor)
+
+    start = sub.add_parser("start", help="Start orchestrator + workers in the current worktree")
+    start.add_argument(
+        "--orchestrator",
+        default=DEFAULT_ORCHESTRATOR,
+        choices=sorted(AGENT_LAUNCH),
+        help=f"Orchestrator agent id (default: {DEFAULT_ORCHESTRATOR} = Claude Opus)",
+    )
+    start.add_argument(
+        "--workers",
+        default=",".join(DEFAULT_WORKERS),
+        help=f"Comma-separated worker agent ids (default: {','.join(DEFAULT_WORKERS)})",
+    )
+    start.add_argument("--objective", default="", help="Team objective / run objective")
+    start.add_argument("--mode", choices=["room", "supervise"], default="room")
+    start.add_argument("--task", default="", help="With --mode supervise, task spec for each worker")
+    start.add_argument(
+        "--layout",
+        choices=["tabs", "split"],
+        default="tabs",
+        help="tabs = one tab per agent (default); split = all agents as panes in one tab",
+    )
+    start.add_argument(
+        "--same-tab",
+        action="store_true",
+        help="Alias for --layout split (open workers as panes in the orchestrator tab)",
+    )
+    start.add_argument(
+        "--split-direction",
+        choices=["horizontal", "vertical"],
+        default="horizontal",
+        help="Initial split direction when --layout split / --same-tab (default: horizontal)",
+    )
+    start.add_argument("--force", action="store_true", help="Start even if ai-team.json says running")
+    start.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not auto-focus/switch to the team tab in the Orca UI (default: open)",
+    )
+    start.set_defaults(func=cmd_start)
+
+    status = sub.add_parser("status", help="Show team state for the current worktree")
+    status.set_defaults(func=cmd_status)
+
+    open_cmd = sub.add_parser(
+        "open",
+        help="Focus the running team tab in Orca UI and raise the Orca window",
+    )
+    open_cmd.set_defaults(func=cmd_open)
+
+    reinject = sub.add_parser(
+        "reinject",
+        help="Re-send role prompts (use when orchestrator starts coding instead of delegating)",
+    )
+    reinject.add_argument(
+        "--orchestrator-only",
+        action="store_true",
+        help="Only reinject the orchestrator prompt",
+    )
+    reinject.set_defaults(func=cmd_reinject)
+
+    set_orch = sub.add_parser(
+        "set-orchestrator",
+        help="Change orchestrator on a live team (rate-limit / model swap) without losing the Run",
+    )
+    set_orch.add_argument(
+        "--agent",
+        required=True,
+        choices=sorted(AGENT_LAUNCH),
+        help="New orchestrator agent id (e.g. claude-sonnet, grok, claude-opus)",
+    )
+    set_orch.add_argument(
+        "--reason",
+        default="",
+        help="Why the swap happened (shown to agents), e.g. 'opus rate limit'",
+    )
+    set_orch.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Always spawn a new pane/tab instead of promoting an existing worker",
+    )
+    set_orch.add_argument(
+        "--close-old",
+        action="store_true",
+        help="Close the previous orchestrator pane/tab after swap (default: keep as standby worker)",
+    )
+    set_orch.add_argument(
+        "--no-open",
+        action="store_true",
+        help="Do not auto-focus the team tab after swap",
+    )
+    set_orch.set_defaults(func=cmd_set_orchestrator)
+
+    send = sub.add_parser("send", help="Send a message on the team run")
+    send.add_argument("--to", default="run", help="run | worker:<id> | handle | run:<id>")
+    send.add_argument("--subject", required=True)
+    send.add_argument("--body", required=True)
+    send.add_argument("--type", default="")
+    send.set_defaults(func=cmd_send)
+
+    stop = sub.add_parser("stop", help="Close team terminals and mark state stopped")
+    stop.add_argument(
+        "--keep-orchestrator",
+        action="store_true",
+        help="Close workers only; leave orchestrator tab open",
+    )
+    stop.set_defaults(func=cmd_stop)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except TeamError as exc:
+        eprint(f"error: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
