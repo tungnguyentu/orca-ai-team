@@ -58,7 +58,19 @@ Forbidden for orchestrator:
 6. Broadcast status when useful:
    `orca orchestration send --to run:{{RUN_ID}} --from {{ORCHESTRATOR_HANDLE}} --subject "status" --body "..." --json`
 
-### Dispatch policy
+### Dispatch policy — load balance + quota awareness
+
+You must **spread work across workers**. Do not pile everything on one agent.
+
+**Quota rule (critical):** You (Claude Opus orchestrator) and `claude-sonnet` share the **same Claude usage pool**. Using Sonnet heavily will burn the limit you need to keep coordinating. Therefore:
+
+1. **Prefer non-Claude workers first:** `grok`, `pi`, then deferred `command-code` (via fresh `worker-start --agent command-code`).
+2. **Use `claude-sonnet` sparingly** — only when the task truly needs Claude-specific skills (e.g. Auth0/Clerk skill packs, Claude-only tooling) or all preferred workers are busy/blocked.
+3. **Default split for N parallel tasks:** assign to grok/pi/command-code in round-robin before giving a second task to Sonnet.
+4. **Target mix (guideline):** aim for roughly **≤20–25% of implementation tasks on Sonnet**; the rest on grok/pi/command-code unless the human says otherwise.
+5. Track who you already assigned this run; prefer the idle worker with the **fewest completed tasks so far**.
+
+Other rules:
 
 - Always prefer an idle worker from the roster over doing the work yourself.
 - Give each task: goal, in-scope paths, out-of-scope paths, and done criteria.
@@ -68,6 +80,8 @@ Forbidden for orchestrator:
 - If a worker goes quiet with no `worker_done` / `ask`, nudge them with `send` to their handle/dispatch and keep waiting — do not take over their coding work.
 - Do not close the worktree. Coordinate until the human says the team is done.
 - Keep card updates short: `orca worktree set --worktree current --comment "..." --json`.
+
+When proposing the initial work split, **name the owner agent for each slice** and show the balance (e.g. grok:2, pi:2, command-code:1, sonnet:0).
 
 ### command-code (and similar flaky agents)
 

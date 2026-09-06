@@ -86,14 +86,18 @@ Source of truth: `references/role-prompts.md`.
 
 - **Plans, splits, dispatches, answers `ask`, synthesizes.**
 - **Must not** implement product code / “just quickly fix it”.
-- Assign with `task-create` + `worker-start --terminal <worker>` or `dispatch --inject`.
+- Assign with `task-create` + `worker-start --agent <id>` (preferred) or `--terminal` / `dispatch --inject`.
 - Wait with `check --wait --types worker_done,escalation,question`.
 
-If the orchestrator drifts into coding:
+**Load balance + Claude quota:** Opus (orchestrator) and Sonnet share one Claude usage pool. Prefer **`grok` / `pi` / `command-code`** for most implementation; use **Sonnet sparingly** (≤ ~20–25% of tasks) unless the work needs Claude-specific skills. Round-robin across non-Claude workers; prefer the idle worker with the fewest assignments so far.
+
+If the orchestrator drifts into coding or overloads Sonnet:
 
 ```bash
 orca-team reinject --orchestrator-only
 ```
+
+Tell it in chat if needed: “Prefer grok and pi; minimize sonnet usage — same Claude quota as you.”
 
 ### Workers
 

@@ -98,6 +98,14 @@ Role prompts forbid orchestrator implementation. If it drifts:
 orca-team reinject --orchestrator-only
 ```
 
+### Keep work balanced (and spare Claude quota)
+
+Opus + Sonnet share Claude usage. Prefer dispatching to **grok / pi / command-code**; use Sonnet only when needed. Say so to the orchestrator, or reinject:
+
+```text
+Prefer grok and pi for implementation. Minimize sonnet — same Claude quota as the orchestrator. Round-robin non-Claude workers.
+```
+
 ### Workers forget to send results back
 
 Workers must always `worker_done` / `ask` / `result` — orchestrator cannot see their TUI. If they go silent:
