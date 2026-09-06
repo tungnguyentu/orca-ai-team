@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.1.3
+version: 0.1.4
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
@@ -109,6 +109,16 @@ Role prompts forbid orchestrator implementation. If it drifts:
 ```bash
 orca-team reinject --orchestrator-only
 ```
+
+### Orchestrator parks workers “pending your approval”
+
+Default is **dispatch without waiting**. If it invents an approval gate (“I’m the bottleneck”, “held T11–T13 for your OK”) while workers sit idle:
+
+```bash
+orca-team reinject --orchestrator-only
+```
+
+Then tell it: dispatch the pending tasks now — only pause when you explicitly ask for a review gate.
 
 ### Keep work balanced (and spare Claude quota)
 

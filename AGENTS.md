@@ -98,16 +98,17 @@ Source of truth: `references/role-prompts.md`.
 - **Must not** implement product code / “just quickly fix it”.
 - Assign with `task-create` + `worker-start --agent <id>` (preferred) or `--terminal` / `dispatch --inject`.
 - Wait with `check --wait --types worker_done,escalation,question`.
+- **Never invent a human-approval gate.** Dispatch in the same turn as the split unless the human explicitly said to wait. Idle workers = orchestrator failure — do not claim “I’m the bottleneck / pending your approval.”
 
 **Load balance + Claude quota:** Opus (orchestrator) and Sonnet share one Claude usage pool. Prefer **`grok` / `pi` / `command-code`** for most implementation; use **Sonnet sparingly** (≤ ~20–25% of tasks) unless the work needs Claude-specific skills. Round-robin across non-Claude workers; prefer the idle worker with the fewest assignments so far.
 
-If the orchestrator drifts into coding or overloads Sonnet:
+If the orchestrator drifts into coding, parks workers behind fake approval gates, or overloads Sonnet:
 
 ```bash
 orca-team reinject --orchestrator-only
 ```
 
-Tell it in chat if needed: “Prefer grok and pi; minimize sonnet usage — same Claude quota as you.”
+Tell it in chat if needed: “Prefer grok and pi; minimize sonnet usage — same Claude quota as you.” Or: “Dispatch now — do not wait for my approval unless I ask.”
 
 ### Workers
 
