@@ -1784,6 +1784,235 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_orca_time(value: Any) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip().replace(" ", "T")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def list_dispatched_tasks(orca: str, *, run_id: str, orch_handle: str) -> list[dict[str, Any]]:
+    payload = orca_json(
+        orca,
+        [
+            "orchestration",
+            "task-list",
+            "--run",
+            run_id,
+            "--status",
+            "dispatched",
+            "--from",
+            orch_handle,
+        ],
+        check=False,
+    )
+    if not payload.get("ok"):
+        return []
+    result = unwrap(payload)
+    tasks = result if isinstance(result, list) else result.get("tasks") or result.get("items") or []
+    return [t for t in tasks if isinstance(t, dict)]
+
+
+def show_dispatch(orca: str, *, task_id: str, orch_handle: str) -> dict[str, Any] | None:
+    payload = orca_json(
+        orca,
+        [
+            "orchestration",
+            "dispatch-show",
+            "--task",
+            task_id,
+            "--from",
+            orch_handle,
+        ],
+        check=False,
+    )
+    if not payload.get("ok"):
+        return None
+    result = unwrap(payload)
+    dispatch = result.get("dispatch") if isinstance(result, dict) else None
+    return dispatch if isinstance(dispatch, dict) else None
+
+
+def terminal_seems_idle(orca: str, handle: str, *, timeout_ms: int = 8000) -> bool | None:
+    """Best-effort: True if tui-idle within timeout, False if timed out, None on error."""
+    payload = orca_json(
+        orca,
+        [
+            "terminal",
+            "wait",
+            "--terminal",
+            handle,
+            "--for",
+            "tui-idle",
+            "--timeout-ms",
+            str(timeout_ms),
+        ],
+        check=False,
+    )
+    if payload.get("ok"):
+        return True
+    err = (payload.get("error") or {}).get("code")
+    if err == "timeout":
+        return False
+    return None
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Monitor dispatched workers; nudge when they go quiet without worker_done."""
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state or state.get("status") != "running":
+        raise TeamError("no running ai-team; start a team first")
+    run_id = str(state.get("runId") or "")
+    orch = next((m for m in state.get("members") or [] if m.get("role") == "orchestrator"), None)
+    if not orch or not orch.get("handle"):
+        raise TeamError("team state missing orchestrator handle")
+    orch_handle = str(orch["handle"])
+
+    # Ensure run is bound for task-list.
+    orca_json(
+        orca,
+        ["orchestration", "run-use", "--id", run_id, "--from", orch_handle],
+        check=False,
+    )
+
+    stale_seconds = max(60, int(args.stale_minutes * 60))
+    interval = max(15, int(args.interval))
+    nudge = not args.no_nudge
+    rounds = 1 if args.once else max(1, int(args.rounds) if args.rounds else 10**9)
+
+    print(
+        f"Watching run {run_id} (stale>{args.stale_minutes}m, "
+        f"nudge={'on' if nudge else 'off'}, once={args.once})"
+    )
+
+    for round_idx in range(rounds):
+        now = datetime.now(timezone.utc)
+        tasks = list_dispatched_tasks(orca, run_id=run_id, orch_handle=orch_handle)
+        if not tasks:
+            print(f"[{utc_now()}] no dispatched tasks")
+        stale_rows: list[dict[str, Any]] = []
+        for task in tasks:
+            task_id = str(task.get("id") or "")
+            if not task_id:
+                continue
+            dispatch = show_dispatch(orca, task_id=task_id, orch_handle=orch_handle) or {}
+            assignee = str(
+                dispatch.get("assignee_handle")
+                or task.get("assignee_handle")
+                or ""
+            )
+            dispatch_id = str(dispatch.get("id") or task.get("dispatch_id") or "")
+            started = _parse_orca_time(dispatch.get("dispatched_at") or dispatch.get("created_at"))
+            heartbeat = _parse_orca_time(dispatch.get("last_heartbeat_at"))
+            age_ref = heartbeat or started
+            age_s = (now - age_ref).total_seconds() if age_ref else None
+            idle = None
+            if assignee and args.idle_check:
+                idle = terminal_seems_idle(orca, assignee, timeout_ms=args.idle_timeout_ms)
+            is_stale = False
+            if age_s is not None and age_s >= stale_seconds:
+                is_stale = True
+            if idle is True and age_s is not None and age_s >= min(120, stale_seconds):
+                # Idle at prompt with an open dispatch is a strong "forgot worker_done" signal.
+                is_stale = True
+            row = {
+                "taskId": task_id,
+                "dispatchId": dispatch_id,
+                "assignee": assignee,
+                "ageSeconds": int(age_s) if age_s is not None else None,
+                "heartbeat": dispatch.get("last_heartbeat_at"),
+                "idle": idle,
+                "stale": is_stale,
+                "spec": (task.get("spec") or "")[:120],
+            }
+            marker = "STALE" if is_stale else "ok"
+            print(
+                f"[{utc_now()}] {marker} {task_id} dispatch={dispatch_id or '-'} "
+                f"assignee={assignee or '-'} age={row['ageSeconds']}s idle={idle}"
+            )
+            if is_stale:
+                stale_rows.append(row)
+
+        if stale_rows and nudge:
+            for row in stale_rows:
+                task_id = row["taskId"]
+                dispatch_id = row["dispatchId"] or "UNKNOWN"
+                assignee = row["assignee"]
+                if not assignee:
+                    continue
+                reminder = (
+                    f"MONITOR NUDGE: Task {task_id} (dispatch {dispatch_id}) is still open "
+                    f"and you look idle/quiet. If you are done or blocked, report NOW.\n\n"
+                    f"If finished:\n"
+                    f"orca orchestration send --type worker_done --subject \"done\" "
+                    f"--body \"<what you did / found / left>\" --task-id {task_id} "
+                    f"--dispatch-id {dispatch_id} --outcome succeeded "
+                    f"--files-modified \"path/a\" --json\n\n"
+                    f"If failed: same with --outcome failed\n"
+                    f"If blocked: orca orchestration ask --question \"...\" --timeout-ms 600000 --json"
+                )
+                print(f"  nudging worker {assignee}")
+                try:
+                    terminal_send(orca, assignee, reminder, retries=2)
+                except TeamError as exc:
+                    eprint(f"  warning: could not nudge {assignee}: {exc}")
+                # Also mail the run so the orchestrator sees it in check.
+                orca_json(
+                    orca,
+                    [
+                        "orchestration",
+                        "send",
+                        "--from",
+                        orch_handle,
+                        "--run",
+                        run_id,
+                        "--to",
+                        f"run:{run_id}",
+                        "--subject",
+                        f"stale worker: {task_id}",
+                        "--body",
+                        (
+                            f"Watchdog: {task_id} / {dispatch_id} assigned to {assignee} "
+                            f"looks stale (age={row['ageSeconds']}s, idle={row['idle']}). "
+                            "Nudge sent to worker. Do not implement their work — wait or reassign."
+                        ),
+                    ],
+                    check=False,
+                )
+            # Ping orchestrator TUI too.
+            try:
+                terminal_send(
+                    orca,
+                    orch_handle,
+                    (
+                        "WATCHDOG: one or more workers look stale without worker_done. "
+                        f"Count={len(stale_rows)}. Check orchestration mail / task-list "
+                        "--status dispatched. Nudge already sent to workers — do not code their tasks."
+                    ),
+                    retries=1,
+                )
+            except TeamError as exc:
+                eprint(f"  warning: could not ping orchestrator: {exc}")
+
+        if args.once or round_idx + 1 >= rounds:
+            break
+        time.sleep(interval)
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="orca-team",
@@ -1891,6 +2120,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not auto-focus the team tab after swap",
     )
     set_orch.set_defaults(func=cmd_set_orchestrator)
+
+    watch = sub.add_parser(
+        "watch",
+        help="Monitor dispatched workers; nudge when they go quiet without worker_done",
+    )
+    watch.add_argument(
+        "--once",
+        action="store_true",
+        help="Scan once and exit (default: loop)",
+    )
+    watch.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help="Seconds between scans when looping (default: 60)",
+    )
+    watch.add_argument(
+        "--rounds",
+        type=int,
+        default=0,
+        help="Max loop rounds when not --once (0 = until interrupted)",
+    )
+    watch.add_argument(
+        "--stale-minutes",
+        type=float,
+        default=15.0,
+        help="Mark a dispatch stale after this many minutes without progress (default: 15)",
+    )
+    watch.add_argument(
+        "--idle-check",
+        action="store_true",
+        help="Also treat tui-idle workers with open dispatches as stale",
+    )
+    watch.add_argument(
+        "--idle-timeout-ms",
+        type=int,
+        default=8000,
+        help="Timeout for --idle-check tui-idle probe (default: 8000)",
+    )
+    watch.add_argument(
+        "--no-nudge",
+        action="store_true",
+        help="Report only; do not send reminder prompts",
+    )
+    watch.set_defaults(func=cmd_watch)
 
     send = sub.add_parser("send", help="Send a message on the team run")
     send.add_argument("--to", default="run", help="run | worker:<id> | handle | run:<id>")

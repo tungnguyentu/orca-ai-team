@@ -58,6 +58,25 @@ Forbidden for orchestrator:
 6. Broadcast status when useful:
    `orca orchestration send --to run:{{RUN_ID}} --from {{ORCHESTRATOR_HANDLE}} --subject "status" --body "..." --json`
 
+### Monitor loop (required — workers forget `worker_done`)
+
+Between `check --wait` timeouts, **sweep open work** yourself (or run the helper):
+
+```bash
+orca-team watch --once --idle-check
+# or continuously in another shell:
+orca-team watch --interval 60 --stale-minutes 10 --idle-check
+```
+
+Manual sweep if needed:
+
+1. `orca orchestration task-list --status dispatched --brief --json`
+2. For each open task: `orca orchestration dispatch-show --task <id> --json`
+3. If the assignee looks idle / quiet for too long, nudge them to send `worker_done` or `ask` — **do not** finish their coding work
+4. Keep waiting with another `check --wait`
+
+Never assume silence means success.
+
 ### Dispatch policy — load balance + quota awareness
 
 You must **spread work across workers**. Do not pile everything on one agent.

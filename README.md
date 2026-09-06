@@ -1,6 +1,6 @@
 # orca-ai-team
 
-**Version:** `0.1.0` (see [`VERSION`](./VERSION))
+**Version:** `0.1.1` (see [`VERSION`](./VERSION))
 
 Orca multi-agent team room launcher + skill.
 
@@ -52,6 +52,7 @@ orca-team start --same-tab --objective "Ship feature X"
 
 orca-team status
 orca-team open
+orca-team watch --once --idle-check   # nudge quiet workers missing worker_done
 orca-team reinject --orchestrator-only
 orca-team set-orchestrator --agent claude-sonnet --reason "opus rate limit"
 orca-team stop

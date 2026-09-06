@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.1.0
+version: 0.1.1
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
@@ -109,7 +109,16 @@ Prefer grok and pi for implementation. Minimize sonnet — same Claude quota as 
 
 ### Workers forget to send results back
 
-Workers must always `worker_done` / `ask` / `result` — orchestrator cannot see their TUI. If they go silent:
+Workers must always `worker_done` / `ask` / `result` — orchestrator cannot see their TUI.
+
+Monitor / nudge stale dispatches:
+
+```bash
+orca-team watch --once --idle-check
+orca-team watch --interval 60 --stale-minutes 10 --idle-check
+```
+
+Or reinject role prompts:
 
 ```bash
 orca-team reinject
