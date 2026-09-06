@@ -1,6 +1,6 @@
 # orca-ai-team
 
-**Version:** `0.1.8` (see [`VERSION`](./VERSION))
+**Version:** `0.1.9` (see [`VERSION`](./VERSION))
 
 Orca multi-agent team room launcher + skill.
 

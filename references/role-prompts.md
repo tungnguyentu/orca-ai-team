@@ -109,12 +109,28 @@ orca-team watch --interval 60 --stale-minutes 10 --idle-check
 
 Manual sweep if needed:
 
-1. `orca orchestration task-list --status dispatched --brief --json`
-2. For each open task: `orca orchestration dispatch-show --task <id> --json`
-3. If the assignee looks idle / quiet for too long, nudge them to send `worker_done` or `ask` — **do not** finish their coding work
-4. Keep waiting with another `check --wait`
+1. **Always check mail first** (do this before trusting a watchdog nudge):
+   `orca orchestration check --peek --types worker_done,question,escalation --json`
+2. `orca orchestration task-list --status dispatched --brief --json`
+3. For each open task: `orca orchestration dispatch-show --task <id> --json`
+4. If `dispatch-show` returns **null** / task is already completed → treat as **done** (worker_done already settled it). Do **not** say the worker is quiet.
+5. Only if dispatch is still open AND there is no recent `worker_done`/`ask`, nudge the assignee — **do not** finish their coding work
+6. Keep waiting with another `check --wait`
 
-Never assume silence means success.
+### Hard rule — never invent “worker is quiet”
+
+Watchdog **idle** only means the TUI looks idle. After a successful `worker_done`, idle is **expected**.
+
+**Forbidden:**
+- “Grok is still quiet — no worker_done yet” without having just run `check` / `dispatch-show` / `task-list`
+- Trusting a watchdog nudge over orchestration mail
+
+**Required before claiming quiet / reassigning:**
+1. `check --peek --types worker_done,question`
+2. `dispatch-show --task <id>` (null ⇒ already settled)
+3. Only then nudge or reassign
+
+Never assume silence means failure — and never assume watchdog idle means missing `worker_done`.
 
 ### Dispatch policy — load balance + quota awareness
 

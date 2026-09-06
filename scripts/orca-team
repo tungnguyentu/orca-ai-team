@@ -2586,21 +2586,17 @@ def show_dispatch(orca: str, *, task_id: str, orch_handle: str) -> dict[str, Any
     return dispatch if isinstance(dispatch, dict) else None
 
 
-def list_unread_questions(orca: str, *, orch_handle: str) -> list[dict[str, Any]]:
-    """Unread question/ask messages waiting on the orchestrator."""
-    payload = orca_json(
-        orca,
-        [
-            "orchestration",
-            "check",
-            "--peek",
-            "--types",
-            "question",
-            "--from",
-            orch_handle,
-        ],
-        check=False,
-    )
+def list_unread_questions(orca: str, *, orch_handle: str, run_id: str = "") -> list[dict[str, Any]]:
+    """Unread question/ask messages waiting on the orchestrator.
+
+    Note: ``orchestration check`` does **not** accept ``--from``; bind the run
+    first with ``run-use --from <orch>``, then ``check --peek --types question``.
+    """
+    _ = orch_handle  # binding happens via run-use before this is called
+    cmd = ["orchestration", "check", "--peek", "--types", "question"]
+    if run_id:
+        cmd.extend(["--run", run_id])
+    payload = orca_json(orca, cmd, check=False)
     if not payload.get("ok"):
         # Fallback: inbox sample (may include already-read items).
         payload = orca_json(
@@ -2708,7 +2704,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
             task_id = str(task.get("id") or "")
             if not task_id:
                 continue
-            dispatch = show_dispatch(orca, task_id=task_id, orch_handle=orch_handle) or {}
+            dispatch_raw = show_dispatch(orca, task_id=task_id, orch_handle=orch_handle)
+            if dispatch_raw is None:
+                # Task listed dispatched but dispatch already settled (worker_done landed).
+                print(
+                    f"[{utc_now()}] settled? {task_id} (dispatch-show null — "
+                    "likely worker_done already; do not nudge as quiet)",
+                    flush=True,
+                )
+                continue
+            dispatch = dispatch_raw or {}
             assignee = str(
                 dispatch.get("assignee_handle")
                 or task.get("assignee_handle")
@@ -2748,7 +2753,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 stale_rows.append(row)
 
         # Unanswered worker asks freeze the assignee — nudge orchestrator to reply.
-        pending_questions = list_unread_questions(orca, orch_handle=orch_handle)
+        pending_questions = list_unread_questions(
+            orca, orch_handle=orch_handle, run_id=run_id
+        )
         if pending_questions:
             print(
                 f"[{utc_now()}] QUESTIONS pending={len(pending_questions)} "
@@ -2838,9 +2845,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     orca,
                     orch_handle,
                     (
-                        "WATCHDOG: one or more workers look stale without worker_done. "
-                        f"Count={len(stale_rows)}. Check orchestration mail / task-list "
-                        "--status dispatched. Nudge already sent to workers — do not code their tasks."
+                        "WATCHDOG: possible stale dispatches. "
+                        f"Count={len(stale_rows)}. BEFORE saying a worker is quiet, run:\n"
+                        "  orca orchestration check --peek --types worker_done,question --json\n"
+                        "  orca orchestration task-list --status dispatched --brief --json\n"
+                        "  orca orchestration dispatch-show --task <id> --json\n"
+                        "If dispatch-show is null or worker_done already exists, the work is DONE "
+                        "(idle TUI after worker_done is normal). Do not reassign completed work."
                     ),
                     retries=1,
                 )
