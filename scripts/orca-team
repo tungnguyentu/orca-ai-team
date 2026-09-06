@@ -570,15 +570,39 @@ def wait_tui_idle(orca: str, handle: str, timeout_ms: int = IDLE_TIMEOUT_MS) -> 
     raise TeamError(f"terminal wait failed for {handle}: {payload.get('error')}")
 
 
-def terminal_read_tail(orca: str, handle: str) -> str:
-    payload = orca_json(orca, ["terminal", "read", "--terminal", handle], check=False)
+def _tail_lines_to_text(tail: Any) -> str:
+    if isinstance(tail, list):
+        parts: list[str] = []
+        for row in tail:
+            if isinstance(row, str):
+                parts.append(row)
+            elif isinstance(row, dict):
+                parts.append(str(row.get("text") or row.get("line") or row.get("content") or ""))
+            else:
+                parts.append(str(row))
+        return "\n".join(parts)
+    if isinstance(tail, str):
+        return tail
+    return str(tail or "")
+
+
+def terminal_read_tail(orca: str, handle: str, *, screen: bool = True) -> str:
+    """Read terminal output. Prefer --screen so TUI dialogs (trust prompts) are visible."""
+    args = ["terminal", "read", "--terminal", handle]
+    if screen:
+        args.append("--screen")
+    payload = orca_json(orca, args, check=False)
     if not payload.get("ok"):
+        if screen:
+            # Fallback to stream history if screen unavailable.
+            return terminal_read_tail(orca, handle, screen=False)
         return ""
     term = unwrap(payload).get("terminal") or unwrap(payload)
-    tail = term.get("tail") or []
-    if isinstance(tail, list):
-        return "\n".join(str(line) for line in tail)
-    return str(tail)
+    text = _tail_lines_to_text(term.get("tail") or [])
+    if screen and not text.strip():
+        # Empty screen frame — try stream history.
+        return terminal_read_tail(orca, handle, screen=False)
+    return text
 
 
 def ensure_claude_project_trust(worktree_path: Path) -> None:
@@ -663,11 +687,19 @@ def dismiss_startup_prompts(orca: str, handle: str, *, agent_id: str) -> None:
             or ("trust" in text and "yes, proceed" in text)
         )
         if needs_yes:
-            answer = "y" if agent_id in {"grok", "codex", "opencode", "pi", "command-code"} else "1"
-            # Claude's dialog is often Enter / numbered; try both styles.
-            if is_claude_agent(agent_id) and "quick safety check" in text:
-                answer = ""  # Enter alone sometimes continues; fall through to y if needed
-            print(f"  accepting trust prompt on {handle} ({agent_id})")
+            # Grok (and similar) show a numbered menu: "1. Yes, proceed" / "2. No, exit".
+            # Sending "y" leaves them stuck on that dialog — prefer "1" when numbered.
+            numbered = "1. yes" in text or "1. yes, proceed" in text or "❯ 1." in text
+            if numbered or "yes, proceed" in text:
+                answer = "1"
+            elif is_claude_agent(agent_id) and "quick safety check" in text:
+                answer = "y"
+            elif agent_id in {"grok", "codex", "opencode", "pi", "command-code"}:
+                # Fallback for y/n style prompts.
+                answer = "1" if "proceed" in text else "y"
+            else:
+                answer = "1"
+            print(f"  accepting trust prompt on {handle} ({agent_id}) with {answer!r}")
             orca_json(
                 orca,
                 [
@@ -676,7 +708,7 @@ def dismiss_startup_prompts(orca: str, handle: str, *, agent_id: str) -> None:
                     "--terminal",
                     handle,
                     "--text",
-                    answer if answer else "y",
+                    answer,
                     "--enter",
                 ],
                 check=False,
