@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.1.6
+version: 0.1.7
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
@@ -125,6 +125,14 @@ orca-team reinject --orchestrator-only
 ```
 
 Then tell it: dispatch the pending tasks now — only pause when you explicitly ask for a review gate.
+
+### Orchestrator ignores worker `ask`
+
+Workers block on `ask` until the orchestrator `reply`s. If a worker is stuck waiting and mail shows unread `question`s, the orchestrator was not in its wait/reply loop — reinject and tell it:
+
+```text
+Answer pending questions first: check --peek --types question, then reply --id …. Do that before chatting with me.
+```
 
 ### Keep work balanced (and spare Claude quota)
 

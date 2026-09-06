@@ -2248,6 +2248,47 @@ def show_dispatch(orca: str, *, task_id: str, orch_handle: str) -> dict[str, Any
     return dispatch if isinstance(dispatch, dict) else None
 
 
+def list_unread_questions(orca: str, *, orch_handle: str) -> list[dict[str, Any]]:
+    """Unread question/ask messages waiting on the orchestrator."""
+    payload = orca_json(
+        orca,
+        [
+            "orchestration",
+            "check",
+            "--peek",
+            "--types",
+            "question",
+            "--from",
+            orch_handle,
+        ],
+        check=False,
+    )
+    if not payload.get("ok"):
+        # Fallback: inbox sample (may include already-read items).
+        payload = orca_json(
+            orca,
+            ["orchestration", "inbox", "--limit", "30"],
+            check=False,
+        )
+        if not payload.get("ok"):
+            return []
+        result = unwrap(payload)
+        msgs = result.get("messages") or result.get("items") or []
+        out = []
+        for m in msgs if isinstance(msgs, list) else []:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("type") or "") != "question":
+                continue
+            if m.get("read") in {1, True, "1"}:
+                continue
+            out.append(m)
+        return out
+    result = unwrap(payload)
+    msgs = result if isinstance(result, list) else result.get("messages") or result.get("items") or []
+    return [m for m in msgs if isinstance(m, dict)]
+
+
 def terminal_seems_idle(orca: str, handle: str, *, timeout_ms: int = 8000) -> bool | None:
     """Best-effort: True if tui-idle within timeout, False if timed out, None on error."""
     payload = orca_json(
@@ -2368,10 +2409,42 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if is_stale:
                 stale_rows.append(row)
 
+        # Unanswered worker asks freeze the assignee — nudge orchestrator to reply.
+        pending_questions = list_unread_questions(orca, orch_handle=orch_handle)
+        if pending_questions:
+            print(
+                f"[{utc_now()}] QUESTIONS pending={len(pending_questions)} "
+                f"(workers blocked on ask until orchestrator replies)",
+                flush=True,
+            )
+            for q in pending_questions[:5]:
+                qid = str(q.get("id") or "")
+                body = str(q.get("body") or q.get("question") or "")[:100]
+                print(f"  question {qid}: {body}", flush=True)
+            if nudge:
+                q_lines = []
+                for q in pending_questions[:8]:
+                    qid = str(q.get("id") or "UNKNOWN")
+                    body = str(q.get("body") or "")[:160]
+                    q_lines.append(f"- {qid}: {body}")
+                reminder = (
+                    "WATCHDOG: unanswered worker ask/question mail is blocking workers.\n"
+                    "Reply NOW before anything else:\n"
+                    "  orca orchestration check --peek --types question --json\n"
+                    "  orca orchestration reply --id <msg_id> --body \"<decisive answer>\" --json\n\n"
+                    "Pending:\n"
+                    + "\n".join(q_lines)
+                )
+                print(f"  nudging orchestrator {orch_handle} about pending questions", flush=True)
+                try:
+                    terminal_send(orca, orch_handle, reminder, retries=1)
+                except TeamError as exc:
+                    eprint(f"  warning: could not nudge orchestrator: {exc}")
+
         next_hint = "" if args.once else f"; next check in {interval}s"
         print(
             f"[{utc_now()}] watching… open_dispatches={len(tasks)} "
-            f"stale={len(stale_rows)}{next_hint}",
+            f"stale={len(stale_rows)} questions={len(pending_questions)}{next_hint}",
             flush=True,
         )
 

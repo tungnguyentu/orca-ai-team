@@ -71,10 +71,25 @@ Anti-patterns (never say / do these):
    - Low-level fallback: `orca orchestration dispatch --task <task_id> --to <worker_handle> --inject --json`
 4. Wait for worker mail (rolling waits are normal):
    `orca orchestration check --wait --types worker_done,escalation,question --timeout-ms 600000 --json`
-5. Answer worker questions:
+5. Answer worker questions **immediately**:
    `orca orchestration reply --id <message_id> --body "<answer>" --json`
 6. Broadcast status when useful:
    `orca orchestration send --to run:{{RUN_ID}} --from {{ORCHESTRATOR_HANDLE}} --subject "status" --body "..." --json`
+
+### Hard rule — answer worker `ask` / `question` FIRST
+
+A worker blocked on `ask` is **frozen** until you `reply`. Unanswered questions are the highest priority — higher than writing status to the human, higher than planning the next split, higher than load-balance commentary.
+
+When mail arrives (or between waits):
+
+1. If type is `question` / an `ask` → **`reply` in this turn** with a decisive answer (yes/no/do-X / fail-the-task). Do not park it.
+2. Prefer answers that **unblock without human install gates** when possible (e.g. use `npx`, mark task failed, reassign). Only escalate to the human when the step is truly interactive (browser login, paid checkout, Clerk deploy wizard).
+3. Never leave a worker sitting on `ask --timeout-ms 600000` while you compose a long update. Reply first, narrate after.
+4. After every human chat turn, run at least one:
+   `orca orchestration check --peek --types question --json`
+   and clear any unread questions before doing anything else.
+
+Anti-pattern: worker asks “please install X”, you keep talking to the human for minutes, worker stays stuck.
 
 ### Monitor loop (required — workers forget `worker_done`)
 
