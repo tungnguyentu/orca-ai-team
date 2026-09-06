@@ -14,12 +14,19 @@ One **orchestrator** plans and dispatches; **workers** implement.
 ## Layout
 
 ```text
+VERSION                       # Canonical semver (keep in sync with plugin + CLI)
 SKILL.md                      # Agent skill frontmatter + human docs
 AGENTS.md                     # This file — for AIs
 README.md                     # Install / quick start
+CONTRIBUTING.md               # How to contribute / release
+DISTRIBUTE.md                 # Skill share + desktop plugin install
+orca-plugin.json              # Experimental Orca desktop plugin manifest
+plugin/                       # Plugin worker + panel
 scripts/orca-team             # CLI (Python 3, no deps beyond stdlib)
 references/role-prompts.md    # Orchestrator + worker prompt templates
 ```
+
+Package version: read `VERSION` or run `orca-team --version`.
 
 Installed as:
 

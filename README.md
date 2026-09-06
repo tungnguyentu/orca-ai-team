@@ -1,11 +1,14 @@
 # orca-ai-team
 
+**Version:** `0.1.0` (see [`VERSION`](./VERSION))
+
 Orca multi-agent team room launcher + skill.
 
 Open one orchestrator plus workers (Claude Opus/Sonnet, Grok, Pi, command-code, …) in an Orca worktree so they can coordinate through `orca orchestration` mail.
 
 **AI agents:** read [`AGENTS.md`](./AGENTS.md) first.  
-**Sharing with others:** see [`DISTRIBUTE.md`](./DISTRIBUTE.md) (skill install + Orca desktop plugin).
+**Sharing with others:** see [`DISTRIBUTE.md`](./DISTRIBUTE.md) (skill install + Orca desktop plugin).  
+**Contributing:** see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
 ### Orca desktop plugin
 
@@ -18,9 +21,10 @@ This repo includes an experimental `orca-plugin.json` + `plugin/` panel/commands
 ```bash
 npx skills add tungnguyentu/orca-ai-team --skill orca-ai-team -g -y
 ln -sfn ~/.agents/skills/orca-ai-team/scripts/orca-team ~/.local/bin/orca-team
+orca-team --version
 ```
 
-Private repo: grant GitHub access, or share via Orca **Skills → Share skills** (unlisted link). See `DISTRIBUTE.md`.
+Optional private distribution via Orca **Skills → Share skills** (unlisted link) is documented in `DISTRIBUTE.md`.
 
 ### From a local checkout
 
@@ -54,3 +58,21 @@ orca-team stop
 ```
 
 Requires Orca runtime with Experimental → orchestration enabled.
+
+## Version
+
+Canonical version lives in [`VERSION`](./VERSION) (semver). The desktop plugin (`orca-plugin.json`) and `orca-team --version` must stay in sync. Release process: see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+
+## Contributing
+
+Bug reports, prompt improvements, CLI fixes, and docs PRs are welcome.
+
+1. Fork and branch from `main`
+2. Keep changes focused; no secrets in commits
+3. Open a PR describing what changed and how you tested
+
+Full guidelines: [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+
+## License
+
+No license file is declared yet. If you need an explicit open-source license for downstream use, open an issue or PR proposing one (MIT/Apache-2.0 preferred).

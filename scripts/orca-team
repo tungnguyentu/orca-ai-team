@@ -40,6 +40,14 @@ AGENT_READY_MARKERS: dict[str, tuple[str, ...]] = {
 }
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 ROLE_PROMPTS_PATH = SKILL_ROOT / "references" / "role-prompts.md"
+VERSION_PATH = SKILL_ROOT / "VERSION"
+
+
+def package_version() -> str:
+    try:
+        return VERSION_PATH.read_text(encoding="utf-8").strip() or "0.0.0"
+    except OSError:
+        return "0.0.0"
 
 # Explicit argv — Orca terminal create does not expand shell aliases.
 AGENT_LAUNCH: dict[str, list[str]] = {
@@ -1780,6 +1788,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="orca-team",
         description="Open a multi-agent Orca team room (orchestrator + workers) in the current worktree.",
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {package_version()}",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

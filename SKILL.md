@@ -1,5 +1,6 @@
 ---
 name: orca-ai-team
+version: 0.1.0
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
