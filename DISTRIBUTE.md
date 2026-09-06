@@ -102,16 +102,46 @@ Official marketplace lives at `stablyai/orca-plugins`. Listings that declare uns
 
 ---
 
+## 3. Desktop plugin (scaffolded in this repo)
+
+Files:
+
+- `orca-plugin.json` — manifest (`tungnguyentu.orca-ai-team`)
+- `plugin/main.mjs` — command worker: types `orca-team start …` into a worktree terminal
+- `plugin/panel.html` — right-sidebar panel with Start button
+
+What it can do (Orca plugin host API v0):
+
+- Command palette: **AI Team: Start (same-tab)** / **… (tabs layout)**
+- Shortcut: `Mod+Alt+A` (worktree context)
+- Panel: pick terminal + optional objective → send start command
+
+What it **cannot** do yet: create a new terminal by itself (host API only has `terminal.sendText`). User must have a shell tab open in the focused worktree. Also requires `orca-team` on PATH (install the skill first).
+
+### Install the plugin in Orca
+
+Orca’s plugin system is still experimental. Typical paths:
+
+1. Open **Plugins** in the Orca app.
+2. Install from Git source: `https://github.com/tungnguyentu/orca-ai-team` (needs access if private), **or** install from a local folder / marketplace listing when available.
+3. Consent to capabilities: workspace read, terminal send, notifications.
+
+Sideload for local testing (paths vary by Orca version): copy/link this repo under Orca’s user plugins directory if the UI offers “Install from folder”, or use the Plugins catalog “from Git” flow.
+
+After install, open a worktree shell and run **AI Team: Start (same-tab)** from the command palette, or use the **AI Team** sidebar panel.
+
+---
+
 ## Recommended plan for “other users can use this”
 
 | Step | Action |
 |------|--------|
-| 1 | Keep repo as skill package (already works: `npx skills add … -l` finds `orca-ai-team`) |
-| 2 | Document install in README (done via this file) |
-| 3 | Ensure `scripts/orca-team` is executable and PATH instructions are clear |
+| 1 | Keep repo as skill package (`npx skills add …`) |
+| 2 | Document install in README + this file |
+| 3 | Symlink `scripts/orca-team` onto PATH |
 | 4 | Share via Orca **Skills → Share skills** link for private distribution |
-| 5 | Optional: public GitHub mirror or make repo public for frictionless `npx skills add` |
-| 6 | Optional later: thin `orca-plugin.json` with a “Start AI Team” command that shells to `orca-team start` |
+| 5 | Optional: public GitHub mirror for frictionless `npx skills add` |
+| 6 | Install desktop plugin (`orca-plugin.json`) for Start button / shortcut |
 
 ---
 

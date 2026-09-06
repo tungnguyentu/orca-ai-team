@@ -1,0 +1,53 @@
+{
+  "manifestVersion": 1,
+  "id": "orca-ai-team",
+  "publisher": "tungnguyentu",
+  "name": "Orca AI Team",
+  "version": "0.1.0",
+  "description": "Start a multi-agent team room (Opus orchestrator + workers) via orca-team in the focused worktree.",
+  "author": {
+    "name": "Tung Nguyen Tu",
+    "url": "https://github.com/tungnguyentu"
+  },
+  "repository": "https://github.com/tungnguyentu/orca-ai-team",
+  "engines": { "orca": ">=1.4.0" },
+  "pluginApi": 1,
+  "main": "plugin/main.mjs",
+  "contributes": {
+    "panels": [
+      {
+        "id": "ai-team",
+        "title": "AI Team",
+        "icon": "users",
+        "entry": "plugin/panel.html"
+      }
+    ],
+    "commands": [
+      {
+        "id": "start-ai-team",
+        "title": "AI Team: Start (same-tab)",
+        "context": "worktree"
+      },
+      {
+        "id": "start-ai-team-tabs",
+        "title": "AI Team: Start (tabs layout)",
+        "context": "worktree"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "start-ai-team",
+        "key": "Mod+Alt+A",
+        "when": "worktree"
+      }
+    ],
+    "events": [{ "on": "worktree.created" }]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "terminal:send" },
+    { "kind": "notifications:show" },
+    { "kind": "storage" },
+    { "kind": "events:subscribe" }
+  ]
+}

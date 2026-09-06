@@ -1,0 +1,211 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        margin: 0;
+        padding: 12px;
+        font-family: system-ui, sans-serif;
+        font-size: 13px;
+        color: var(--foreground, #ddd);
+        background: var(--background, transparent);
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 8px;
+      }
+      p {
+        margin: 0 0 10px;
+        color: var(--muted-foreground, #999);
+        line-height: 1.4;
+      }
+      label {
+        display: block;
+        margin: 10px 0 4px;
+        font-size: 12px;
+        color: var(--muted-foreground, #999);
+      }
+      input[type='text'],
+      select {
+        width: 100%;
+        box-sizing: border-box;
+        margin: 0 0 8px;
+        padding: 6px 8px;
+        border: 1px solid var(--border, #555);
+        border-radius: 6px;
+        background: var(--secondary, #2a2a2a);
+        color: var(--foreground, #ddd);
+        font: inherit;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 8px 0;
+      }
+      button {
+        display: block;
+        width: 100%;
+        margin: 6px 0;
+        padding: 8px 10px;
+        border: 1px solid var(--border, #555);
+        border-radius: 6px;
+        background: var(--secondary, #2a2a2a);
+        color: var(--foreground, #ddd);
+        cursor: pointer;
+        font: inherit;
+      }
+      button.primary {
+        background: var(--primary, #3b82f6);
+        border-color: transparent;
+        color: var(--primary-foreground, #fff);
+      }
+      .status {
+        margin-top: 10px;
+        min-height: 1.4em;
+        color: var(--muted-foreground, #999);
+        white-space: pre-wrap;
+      }
+      code {
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Orca AI Team</h1>
+    <p>
+      Types <code>orca-team start</code> into a terminal in the focused worktree.
+      Install the skill + put <code>orca-team</code> on PATH first.
+    </p>
+
+    <button id="refresh">Refresh worktree / terminals</button>
+
+    <label for="terms">Terminal</label>
+    <select id="terms" disabled>
+      <option value="">No worktree / terminals</option>
+    </select>
+
+    <label for="objective">Objective (optional)</label>
+    <input id="objective" type="text" placeholder="Ship feature X" />
+
+    <div class="row">
+      <input id="sameTab" type="checkbox" checked />
+      <label for="sameTab" style="margin: 0">Same-tab split layout</label>
+    </div>
+
+    <button id="start" class="primary" disabled>Start AI Team</button>
+    <p class="status" id="status"></p>
+
+    <script>
+      'use strict'
+      var seq = 0
+      var pending = {}
+      var statusEl = document.getElementById('status')
+      var termsEl = document.getElementById('terms')
+      var startBtn = document.getElementById('start')
+
+      function call(action, params) {
+        return new Promise(function (resolve) {
+          var requestId = 'req-' + ++seq
+          pending[requestId] = resolve
+          window.parent.postMessage(
+            { type: 'orca-panel-action', requestId: requestId, action: action, params: params },
+            '*'
+          )
+        })
+      }
+
+      window.addEventListener('message', function (event) {
+        var data = event.data
+        if (!data || data.type !== 'orca-panel-action-result') return
+        var resolve = pending[data.requestId]
+        if (!resolve) return
+        delete pending[data.requestId]
+        resolve(data)
+      })
+
+      function buildCommand() {
+        var parts = ['orca-team', 'start']
+        if (document.getElementById('sameTab').checked) parts.push('--same-tab')
+        var goal = document.getElementById('objective').value.trim()
+        if (goal) {
+          var escaped = goal.replace(/'/g, "'\"'\"'")
+          parts.push('--objective', "'" + escaped + "'")
+        }
+        return parts.join(' ')
+      }
+
+      function refresh() {
+        statusEl.textContent = 'Loading…'
+        call('workspace.readContext').then(function (result) {
+          if (!result.ok) {
+            statusEl.textContent = 'context failed: ' + (result.error || result.errorCode)
+            termsEl.innerHTML = '<option value="">Unavailable</option>'
+            termsEl.disabled = true
+            startBtn.disabled = true
+            return
+          }
+          if (!result.value) {
+            statusEl.textContent = 'No focused worktree. Open one first.'
+            termsEl.innerHTML = '<option value="">No worktree</option>'
+            termsEl.disabled = true
+            startBtn.disabled = true
+            return
+          }
+          var terminals = result.value.terminals || []
+          termsEl.innerHTML = ''
+          if (terminals.length === 0) {
+            termsEl.innerHTML = '<option value="">No terminals — open a shell tab</option>'
+            termsEl.disabled = true
+            startBtn.disabled = true
+            statusEl.textContent =
+              result.value.displayName + ' on ' + result.value.branch + ' (no terminals)'
+            return
+          }
+          terminals.forEach(function (terminal) {
+            var option = document.createElement('option')
+            option.value = terminal.id
+            option.textContent = terminal.id
+            termsEl.appendChild(option)
+          })
+          termsEl.disabled = false
+          startBtn.disabled = false
+          statusEl.textContent =
+            result.value.displayName +
+            ' on ' +
+            result.value.branch +
+            ' · ' +
+            terminals.length +
+            ' terminal(s)'
+        })
+      }
+
+      document.getElementById('refresh').addEventListener('click', refresh)
+      startBtn.addEventListener('click', function () {
+        var terminalId = termsEl.value
+        if (!terminalId) return
+        var command = buildCommand()
+        statusEl.textContent = 'Sending: ' + command
+        call('terminal.sendText', {
+          terminalId: terminalId,
+          text: command,
+          enter: true
+        }).then(function (result) {
+          if (!result.ok) {
+            statusEl.textContent = 'send failed: ' + (result.error || result.errorCode)
+            return
+          }
+          statusEl.textContent =
+            'Typed into ' + terminalId + ' (accepted=' + result.value.accepted + '):\n' + command
+          call('notifications.show', {
+            title: 'AI Team',
+            body: result.value.accepted ? 'Start command sent' : 'Send not accepted'
+          })
+        })
+      })
+
+      refresh()
+    </script>
+  </body>
+</html>

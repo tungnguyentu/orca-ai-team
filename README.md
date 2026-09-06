@@ -5,7 +5,11 @@ Orca multi-agent team room launcher + skill.
 Open one orchestrator plus workers (Claude Opus/Sonnet, Grok, Pi, command-code, …) in an Orca worktree so they can coordinate through `orca orchestration` mail.
 
 **AI agents:** read [`AGENTS.md`](./AGENTS.md) first.  
-**Sharing with others:** see [`DISTRIBUTE.md`](./DISTRIBUTE.md) (Orca skill share vs desktop plugins).
+**Sharing with others:** see [`DISTRIBUTE.md`](./DISTRIBUTE.md) (skill install + Orca desktop plugin).
+
+### Orca desktop plugin
+
+This repo includes an experimental `orca-plugin.json` + `plugin/` panel/commands that type `orca-team start` into a worktree terminal (requires `orca-team` on PATH and an open shell tab). Install via Orca **Plugins** (from Git / folder). See `DISTRIBUTE.md`.
 
 ## Install
 
