@@ -74,7 +74,7 @@ orca-team reinject             # re-send role prompts
 orca-team reinject --orchestrator-only
 orca-team set-orchestrator --agent claude-sonnet --reason "opus rate limit"
 orca-team send --to run --subject "..." --body "..."
-orca-team stop                 # closes tabs + deletes watch log
+orca-team stop                 # closes tabs, deletes watch log, writes AI-TEAM-HANDOFF.md
 ```
 
 ### Layout

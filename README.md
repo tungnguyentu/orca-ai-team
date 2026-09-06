@@ -1,6 +1,6 @@
 # orca-ai-team
 
-**Version:** `0.1.7` (see [`VERSION`](./VERSION))
+**Version:** `0.1.8` (see [`VERSION`](./VERSION))
 
 Orca multi-agent team room launcher + skill.
 
@@ -58,7 +58,8 @@ orca-team open
 orca-team watch --once --idle-check   # extra one-shot nudge
 orca-team reinject --orchestrator-only
 orca-team set-orchestrator --agent claude-sonnet --reason "opus rate limit"
-orca-team stop   # closes tabs + deletes .orca/ai-team-watch.log
+orca-team stop   # closes tabs, deletes watch log, writes AI-TEAM-HANDOFF.md
+# next start auto-loads AI-TEAM-HANDOFF.md into the orchestrator
 ```
 
 Requires Orca runtime with Experimental → orchestration enabled.

@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.1.7
+version: 0.1.8
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
@@ -39,7 +39,8 @@ orca-team start --objective "Ship feature X"
 # Talk in the orchestrator tab (`ai-team:orch`) inside Orca.
 orca-team status
 orca-team send --to run --subject "standup" --body "Status check"
-orca-team stop   # also deletes .orca/ai-team-watch.log
+orca-team stop   # writes AI-TEAM-HANDOFF.md + deletes watch log
+# next start loads AI-TEAM-HANDOFF.md into the orchestrator automatically
 ```
 
 Custom roster:
@@ -77,7 +78,7 @@ orca-team set-orchestrator --agent claude-sonnet --reason "limit" --close-old
 
 ### Background watch (default on)
 
-`start` launches a detached `orca-team watch` process that nudges idle/stale workers missing `worker_done`. `stop` kills it **and deletes** `.orca/ai-team-watch.log`.
+`start` launches a detached `orca-team watch` process that nudges idle/stale workers missing `worker_done`. `stop` kills it, **deletes** `.orca/ai-team-watch.log`, and writes **`AI-TEAM-HANDOFF.md`** in the worktree (objective, git snapshot, open tasks, recent `worker_done` / questions). The next `start` loads that file into the orchestrator prompt. Use `--no-handoff` on stop/start to skip.
 
 ```bash
 orca-team start --objective "Ship feature X"          # watch on

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -18,6 +19,9 @@ from typing import Any
 STATE_DIRNAME = ".orca"
 STATE_FILENAME = "ai-team.json"
 WATCH_LOG_FILENAME = "ai-team-watch.log"
+# Project-root handoff so the next `orca-team start` can resume context.
+HANDOFF_FILENAME = "AI-TEAM-HANDOFF.md"
+HANDOFF_MAX_CHARS = 12_000
 DEFAULT_WATCH_INTERVAL = 60
 DEFAULT_WATCH_STALE_MINUTES = 15.0
 # Layout: dual = orchestrator alone in one tab, all workers split in a second tab.
@@ -262,6 +266,297 @@ def delete_watch_log(worktree_path: Path) -> bool:
     except OSError as exc:
         eprint(f"warning: could not delete watch log {path}: {exc}")
     return False
+
+
+def handoff_path_for(worktree_path: Path) -> Path:
+    return worktree_path / HANDOFF_FILENAME
+
+
+def load_handoff_text(worktree_path: Path, *, max_chars: int = HANDOFF_MAX_CHARS) -> str | None:
+    path = handoff_path_for(worktree_path)
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    if len(text) > max_chars:
+        return (
+            text[:max_chars]
+            + f"\n\n… truncated ({len(text)} chars total; see `{HANDOFF_FILENAME}`)\n"
+        )
+    return text
+
+
+def _git_snapshot(worktree_path: Path) -> dict[str, str]:
+    out: dict[str, str] = {"branch": "", "status": "", "log": ""}
+    try:
+        branch = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if branch.returncode == 0:
+            out["branch"] = branch.stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(worktree_path), "status", "--short"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status.returncode == 0:
+            lines = [ln for ln in status.stdout.splitlines() if ln.strip()]
+            out["status"] = "\n".join(lines[:40])
+            if len(lines) > 40:
+                out["status"] += f"\n… ({len(lines) - 40} more)"
+        log = subprocess.run(
+            ["git", "-C", str(worktree_path), "log", "-5", "--oneline"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if log.returncode == 0:
+            out["log"] = log.stdout.strip()
+    except OSError:
+        pass
+    return out
+
+
+def _redact_secrets(text: str) -> str:
+    """Best-effort scrub of common secret shapes before writing handoff."""
+    patterns = [
+        (re.compile(r"(?i)(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*\S+"), r"\1: [REDACTED]"),
+        (re.compile(r"(?i)\b(sk-[a-z0-9_-]{16,})\b"), "[REDACTED_KEY]"),
+        (re.compile(r"(?i)\b(ghp_[a-z0-9]{20,})\b"), "[REDACTED_TOKEN]"),
+        (re.compile(r"(?i)\b(xox[baprs]-[a-z0-9-]{10,})\b"), "[REDACTED_TOKEN]"),
+        (re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._\-]+"), r"\1[REDACTED]"),
+    ]
+    out = text
+    for pat, repl in patterns:
+        out = pat.sub(repl, out)
+    return out
+
+
+def collect_inbox_summaries(orca: str, *, orch_handle: str, limit: int = 25) -> list[dict[str, str]]:
+    payload = orca_json(
+        orca,
+        ["orchestration", "inbox", "--limit", str(limit)],
+        check=False,
+    )
+    if not payload.get("ok"):
+        # Try with --from if required by runtime.
+        payload = orca_json(
+            orca,
+            ["orchestration", "inbox", "--limit", str(limit), "--from", orch_handle],
+            check=False,
+        )
+    if not payload.get("ok"):
+        return []
+    result = unwrap(payload)
+    msgs = result.get("messages") or result.get("items") or []
+    out: list[dict[str, str]] = []
+    for m in msgs if isinstance(msgs, list) else []:
+        if not isinstance(m, dict):
+            continue
+        mtype = str(m.get("type") or "")
+        if mtype not in {"worker_done", "question", "escalation", "status", "result", "update"}:
+            # Keep heartbeats out of the handoff noise.
+            if mtype == "heartbeat":
+                continue
+        body = str(m.get("body") or "")
+        out.append(
+            {
+                "id": str(m.get("id") or ""),
+                "type": mtype or "message",
+                "subject": str(m.get("subject") or ""),
+                "from": str(m.get("from_handle") or m.get("from") or ""),
+                "body": body[:240],
+                "created": str(m.get("created_at") or ""),
+            }
+        )
+    return out
+
+
+def collect_task_summaries(orca: str, *, run_id: str, orch_handle: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for status in ("dispatched", "ready", "blocked", "done", "failed"):
+        payload = orca_json(
+            orca,
+            [
+                "orchestration",
+                "task-list",
+                "--run",
+                run_id,
+                "--status",
+                status,
+                "--brief",
+                "--from",
+                orch_handle,
+            ],
+            check=False,
+        )
+        if not payload.get("ok"):
+            continue
+        result = unwrap(payload)
+        tasks = result if isinstance(result, list) else result.get("tasks") or result.get("items") or []
+        for t in tasks if isinstance(tasks, list) else []:
+            if not isinstance(t, dict):
+                continue
+            rows.append(
+                {
+                    "id": str(t.get("id") or ""),
+                    "status": status,
+                    "spec": str(t.get("spec") or "")[:160],
+                    "assignee": str(t.get("assignee_handle") or ""),
+                }
+            )
+    return rows
+
+
+def write_session_handoff(
+    orca: str,
+    *,
+    worktree_path: Path,
+    state: dict[str, Any],
+) -> Path | None:
+    """Write AI-TEAM-HANDOFF.md so the next team start resumes project context."""
+    run_id = str(state.get("runId") or "")
+    orch = next((m for m in state.get("members") or [] if m.get("role") == "orchestrator"), None)
+    orch_handle = str((orch or {}).get("handle") or "")
+    if run_id and orch_handle:
+        orca_json(
+            orca,
+            ["orchestration", "run-use", "--id", run_id, "--from", orch_handle],
+            check=False,
+        )
+
+    git = _git_snapshot(worktree_path)
+    inbox = collect_inbox_summaries(orca, orch_handle=orch_handle) if orch_handle else []
+    tasks = (
+        collect_task_summaries(orca, run_id=run_id, orch_handle=orch_handle)
+        if run_id and orch_handle
+        else []
+    )
+    members = list(state.get("members") or [])
+    member_lines = []
+    for m in members:
+        member_lines.append(
+            f"- {m.get('role')}:{m.get('agentId')} handle=`{m.get('handle') or '-'}`"
+            + (" (deferred)" if m.get("deferred") else "")
+        )
+
+    done_msgs = [m for m in inbox if m["type"] == "worker_done"]
+    questions = [m for m in inbox if m["type"] == "question"]
+    open_tasks = [t for t in tasks if t["status"] in {"dispatched", "ready", "blocked"}]
+    finished_tasks = [t for t in tasks if t["status"] in {"done", "failed"}]
+
+    lines: list[str] = [
+        "# AI Team session handoff",
+        "",
+        "Written by `orca-team stop`. The next `orca-team start` in this worktree loads this",
+        "file into the orchestrator so the new team can continue without losing context.",
+        "",
+        "## Meta",
+        "",
+        f"- Stopped at: `{utc_now()}`",
+        f"- Previous runId: `{run_id or '-'}`",
+        f"- Objective: {state.get('objective') or '(none)'}",
+        f"- Layout: `{state.get('layout') or '-'}`",
+        f"- Started at: `{state.get('startedAt') or '-'}`",
+        f"- Worktree: `{worktree_path}`",
+        "",
+        "## Roster (last session)",
+        "",
+    ]
+    lines.extend(member_lines or ["- (none)"])
+    lines.extend(
+        [
+            "",
+            "## Git",
+            "",
+            f"- Branch: `{git.get('branch') or 'unknown'}`",
+            "",
+            "### Recent commits",
+            "",
+            "```",
+            git.get("log") or "(unavailable)",
+            "```",
+            "",
+            "### Working tree (`git status --short`)",
+            "",
+            "```",
+            git.get("status") or "(clean or unavailable)",
+            "```",
+            "",
+            "## Open / unfinished work",
+            "",
+        ]
+    )
+    if open_tasks:
+        for t in open_tasks:
+            lines.append(
+                f"- [{t['status']}] `{t['id']}` assignee=`{t['assignee'] or '-'}` — {t['spec']}"
+            )
+    else:
+        lines.append("- (no open orchestration tasks listed)")
+
+    if questions:
+        lines.extend(["", "## Unresolved questions (were blocking workers)", ""])
+        for q in questions[:12]:
+            lines.append(f"- `{q['id']}` from `{q['from']}`: {q['body']}")
+
+    lines.extend(["", "## Recent worker_done / results", ""])
+    if done_msgs:
+        for m in done_msgs[:15]:
+            lines.append(
+                f"- `{m['created']}` `{m['id']}` {m['subject'] or m['type']}: {m['body']}"
+            )
+    else:
+        lines.append("- (none captured in inbox sample)")
+
+    if finished_tasks:
+        lines.extend(["", "## Finished tasks (sample)", ""])
+        for t in finished_tasks[:15]:
+            lines.append(f"- [{t['status']}] `{t['id']}` — {t['spec']}")
+
+    lines.extend(
+        [
+            "",
+            "## Next session — start here",
+            "",
+            "1. Read this handoff and verify git status / branch still match.",
+            "2. Resume **open / unfinished** items first; do not redo completed `worker_done` work.",
+            "3. Resolve any unresolved questions (or drop obsolete ones) before new dispatches.",
+            "4. Prefer non-Claude workers (grok/pi/command-code) for implementation; spare Sonnet quota.",
+            "5. Dispatch in the same turn as the plan split — do not invent a human-approval gate.",
+            "",
+            "## Notes for humans",
+            "",
+            "- Secrets are best-effort redacted; still avoid pasting tokens into chat.",
+            f"- This file is overwritten on each `orca-team stop`. Path: `{HANDOFF_FILENAME}`.",
+            "",
+        ]
+    )
+
+    text = _redact_secrets("\n".join(lines))
+    path = handoff_path_for(worktree_path)
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        eprint(f"warning: could not write handoff {path}: {exc}")
+        return None
+    # Mirror under .orca for tooling that prefers that directory.
+    try:
+        mirror = worktree_path / STATE_DIRNAME / HANDOFF_FILENAME
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        mirror.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+    return path
 
 
 def load_state(worktree_path: Path) -> dict[str, Any] | None:
@@ -1294,6 +1589,22 @@ def cmd_start(args: argparse.Namespace) -> int:
             )
     roster = "\n".join(roster_lines) if roster_lines else "- (no workers)"
 
+    load_handoff = not getattr(args, "no_handoff", False)
+    prior_handoff = None
+    if load_handoff:
+        prior_handoff = load_handoff_text(worktree_path)
+        if prior_handoff:
+            print(f"  loaded prior handoff: {handoff_path_for(worktree_path)}")
+        else:
+            print(f"  no prior {HANDOFF_FILENAME} (fresh context)")
+    else:
+        print("  handoff load: skipped (--no-handoff)")
+    prior_handoff_block = (
+        prior_handoff
+        if prior_handoff
+        else f"(none — no `{HANDOFF_FILENAME}` in this worktree yet)"
+    )
+
     # 4) Inject role prompts (skip deferred workers — no pane yet)
     for member in members:
         if member.get("deferred") or not member.get("handle"):
@@ -1308,6 +1619,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                     "WORKTREE_PATH": str(worktree_path),
                     "ORCHESTRATOR_HANDLE": orch_handle,
                     "ROSTER": roster,
+                    "PRIOR_HANDOFF": prior_handoff_block,
                 },
             )
         else:
@@ -1564,8 +1876,17 @@ def build_role_prompt(
     worktree_path: Path,
     orch_handle: str,
     roster: str,
+    prior_handoff: str | None = None,
 ) -> str:
     if member.get("role") == "orchestrator":
+        handoff = prior_handoff
+        if handoff is None:
+            handoff = load_handoff_text(worktree_path)
+        handoff_block = (
+            handoff
+            if handoff
+            else f"(none — no `{HANDOFF_FILENAME}` in this worktree yet)"
+        )
         return render(
             templates["orchestrator"],
             {
@@ -1574,6 +1895,7 @@ def build_role_prompt(
                 "WORKTREE_PATH": str(worktree_path),
                 "ORCHESTRATOR_HANDLE": orch_handle,
                 "ROSTER": roster,
+                "PRIOR_HANDOFF": handoff_block,
             },
         )
     return render(
@@ -2096,6 +2418,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
     layout = state.get("layout") or "tabs"
     members = list(state.get("members") or [])
 
+    # Capture continuity BEFORE closing panes (needs live orch handle for inbox/tasks).
+    handoff_path: Path | None = None
+    if not getattr(args, "no_handoff", False):
+        handoff_path = write_session_handoff(orca, worktree_path=worktree_path, state=state)
+        if handoff_path:
+            print(f"  wrote session handoff: {handoff_path}")
+            state["handoffPath"] = str(handoff_path)
+            state["handoffWrittenAt"] = utc_now()
+        else:
+            eprint("  warning: session handoff was not written")
+    else:
+        print("  handoff: skipped (--no-handoff)")
+
     old_watch_pid = state.get("watchPid")
     if stop_watch_process(state):
         print(f"  stopped watch pid {old_watch_pid}")
@@ -2186,6 +2521,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
         pass
 
     print(f"Stopped team run {state.get('runId')} (closed {len(closed)} tab(s)).")
+    if handoff_path:
+        print(f"  handoff:  {handoff_path}")
+        print("  next:     orca-team start   # loads AI-TEAM-HANDOFF.md into orchestrator")
     if errors and not closed:
         return 1
     return 0
@@ -2599,6 +2937,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     start.add_argument(
+        "--no-handoff",
+        action="store_true",
+        help=f"Do not load prior {HANDOFF_FILENAME} into the orchestrator prompt",
+    )
+    start.add_argument(
         "--watch-interval",
         type=int,
         default=DEFAULT_WATCH_INTERVAL,
@@ -2721,11 +3064,19 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--type", default="")
     send.set_defaults(func=cmd_send)
 
-    stop = sub.add_parser("stop", help="Close team terminals and mark state stopped")
+    stop = sub.add_parser(
+        "stop",
+        help=f"Close team terminals, write {HANDOFF_FILENAME}, mark state stopped",
+    )
     stop.add_argument(
         "--keep-orchestrator",
         action="store_true",
         help="Close workers only; leave orchestrator tab open",
+    )
+    stop.add_argument(
+        "--no-handoff",
+        action="store_true",
+        help=f"Do not write {HANDOFF_FILENAME} for the next team start",
     )
     stop.set_defaults(func=cmd_stop)
 
