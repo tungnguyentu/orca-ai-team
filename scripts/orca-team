@@ -346,19 +346,26 @@ def start_background_watch(
     stale_minutes: float = DEFAULT_WATCH_STALE_MINUTES,
     idle_check: bool = True,
 ) -> dict[str, Any]:
-    """Detach `orca-team watch` in the worktree; log to `.orca/ai-team-watch.log`."""
+    """Detach `orca-team watch` in the worktree; log to `.orca/ai-team-watch.log`.
+
+    Child opens its own log via ``--log-file``; parent keeps stdout/stderr as
+    DEVNULL so start never looks blocked on the watchdog.
+    """
     script = Path(__file__).resolve()
     log_path = watch_log_path_for(worktree_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    interval = max(15, int(interval))
     cmd = [
         sys.executable,
         "-u",
         str(script),
         "watch",
         "--interval",
-        str(max(15, int(interval))),
+        str(interval),
         "--stale-minutes",
         str(stale_minutes),
+        "--log-file",
+        str(log_path),
     ]
     if idle_check:
         cmd.append("--idle-check")
@@ -366,30 +373,39 @@ def start_background_watch(
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    with open(log_path, "a", encoding="utf-8") as log_fh:
-        log_fh.write(f"\n--- watch start {utc_now()} pid=pending ---\n")
-        log_fh.write(f"cmd: {' '.join(cmd)}\n")
-        log_fh.flush()
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(worktree_path),
-            stdin=subprocess.DEVNULL,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            env=env,
-        )
-    # Append pid after spawn (best-effort; child already has the open fd).
     try:
         with open(log_path, "a", encoding="utf-8") as log_fh:
-            log_fh.write(f"--- watch pid {proc.pid} ---\n")
+            log_fh.write(f"\n--- spawning watch {utc_now()} ---\n")
+            log_fh.write(f"cmd: {' '.join(cmd)}\n")
     except OSError:
         pass
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(worktree_path),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+        env=env,
+    )
+    # Confirm the detached process actually stayed up briefly.
+    time.sleep(0.4)
+    alive = pid_alive(proc.pid)
+    try:
+        with open(log_path, "a", encoding="utf-8") as log_fh:
+            log_fh.write(
+                f"--- watch pid {proc.pid} ({'alive' if alive else 'EXITED EARLY'}) ---\n"
+            )
+    except OSError:
+        pass
+    if not alive:
+        raise OSError(f"background watch pid {proc.pid} exited immediately; see {log_path}")
     return {
         "pid": proc.pid,
         "log": str(log_path),
-        "interval": max(15, int(interval)),
+        "interval": interval,
         "staleMinutes": float(stale_minutes),
         "idleCheck": bool(idle_check),
         "cmd": cmd,
@@ -1339,14 +1355,10 @@ def cmd_start(args: argparse.Namespace) -> int:
             state["watchStaleMinutes"] = watch_info["staleMinutes"]
             state["watchStartedAt"] = utc_now()
             path = save_state(worktree_path, state)
-            print(
-                f"  watch: pid {watch_info['pid']} "
-                f"(every {watch_info['interval']}s, stale>{watch_info['staleMinutes']}m, idle-check) "
-                f"log {watch_info['log']}"
-            )
         except OSError as exc:
             eprint(f"warning: could not start background watch: {exc}")
             state["watchEnabled"] = False
+            state["watchPid"] = None
             save_state(worktree_path, state)
 
     # Best-effort worktree comment — visible on remote worktree cards.
@@ -1384,9 +1396,18 @@ def cmd_start(args: argparse.Namespace) -> int:
     print(f"  layout:   {layout}")
     print(f"  state:    {path}")
     if state.get("watchPid"):
-        print(f"  watch:    pid {state['watchPid']} (auto; disable with --no-watch)")
+        rel_log = state.get("watchLog") or str(watch_log_path_for(worktree_path))
+        print(f"  watch:    RUNNING pid {state['watchPid']} (background)")
+        print(
+            f"            every {state.get('watchInterval', DEFAULT_WATCH_INTERVAL)}s, "
+            f"stale>{state.get('watchStaleMinutes', DEFAULT_WATCH_STALE_MINUTES)}m, idle-check"
+        )
+        print(f"            log: {rel_log}")
+        print(f"            follow: tail -f {rel_log}")
     elif not enable_watch:
         print("  watch:    off (--no-watch)")
+    else:
+        print("  watch:    failed to start (see warnings above)")
     if layout == "split":
         print(f"  next:     open worktree + tab '{tab_title}' (split panes: all agents)")
     else:
@@ -1394,6 +1415,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     print("  open:     orca-team open   # host focus + remote instructions")
     print("  status:   orca-team status")
     print("  stop:     orca-team stop")
+    print("\nStart finished — shell is free. Watch keeps running in the background.")
+    sys.stdout.flush()
     return 0
 
 
@@ -2074,8 +2097,21 @@ def terminal_seems_idle(orca: str, handle: str, *, timeout_ms: int = 8000) -> bo
     return None
 
 
+def _redirect_watch_log(log_file: str | None) -> None:
+    """When spawned in background, write heartbeats to a log file instead of /dev/null."""
+    if not log_file:
+        return
+    path = Path(log_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Line-buffered so `tail -f` shows watching heartbeats promptly.
+    log_fh = open(path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = log_fh  # type: ignore[assignment]
+    sys.stderr = log_fh  # type: ignore[assignment]
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Monitor dispatched workers; nudge when they go quiet without worker_done."""
+    _redirect_watch_log(getattr(args, "log_file", None))
     orca = resolve_orca()
     cwd = Path.cwd()
     wt = find_worktree(orca, cwd)
@@ -2102,18 +2138,17 @@ def cmd_watch(args: argparse.Namespace) -> int:
     rounds = 1 if args.once else max(1, int(args.rounds) if args.rounds else 10**9)
 
     print(
-        f"Watching run {run_id} (stale>{args.stale_minutes}m, "
-        f"nudge={'on' if nudge else 'off'}, once={args.once})"
+        f"watching run {run_id} (stale>{args.stale_minutes}m, "
+        f"nudge={'on' if nudge else 'off'}, once={args.once}, interval={interval}s)",
+        flush=True,
     )
 
     for round_idx in range(rounds):
         if not team_still_running(worktree_path, run_id):
-            print(f"[{utc_now()}] team stopped or run changed; watch exiting")
+            print(f"[{utc_now()}] watching stopped — team ended or run changed", flush=True)
             return 0
         now = datetime.now(timezone.utc)
         tasks = list_dispatched_tasks(orca, run_id=run_id, orch_handle=orch_handle)
-        if not tasks:
-            print(f"[{utc_now()}] no dispatched tasks")
         stale_rows: list[dict[str, Any]] = []
         for task in tasks:
             task_id = str(task.get("id") or "")
@@ -2152,10 +2187,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
             marker = "STALE" if is_stale else "ok"
             print(
                 f"[{utc_now()}] {marker} {task_id} dispatch={dispatch_id or '-'} "
-                f"assignee={assignee or '-'} age={row['ageSeconds']}s idle={idle}"
+                f"assignee={assignee or '-'} age={row['ageSeconds']}s idle={idle}",
+                flush=True,
             )
             if is_stale:
                 stale_rows.append(row)
+
+        next_hint = "" if args.once else f"; next check in {interval}s"
+        print(
+            f"[{utc_now()}] watching… open_dispatches={len(tasks)} "
+            f"stale={len(stale_rows)}{next_hint}",
+            flush=True,
+        )
 
         if stale_rows and nudge:
             for row in stale_rows:
@@ -2175,7 +2218,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     f"If failed: same with --outcome failed\n"
                     f"If blocked: orca orchestration ask --question \"...\" --timeout-ms 600000 --json"
                 )
-                print(f"  nudging worker {assignee}")
+                print(f"  nudging worker {assignee}", flush=True)
                 try:
                     terminal_send(orca, assignee, reminder, retries=2)
                 except TeamError as exc:
@@ -2224,7 +2267,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
         slept = 0
         while slept < interval:
             if not team_still_running(worktree_path, run_id):
-                print(f"[{utc_now()}] team stopped or run changed; watch exiting")
+                print(
+                    f"[{utc_now()}] watching stopped — team ended or run changed",
+                    flush=True,
+                )
                 return 0
             step = min(5, interval - slept)
             time.sleep(step)
@@ -2404,6 +2450,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-nudge",
         action="store_true",
         help="Report only; do not send reminder prompts",
+    )
+    watch.add_argument(
+        "--log-file",
+        default="",
+        help="Append watching heartbeats to this file (used by background start)",
     )
     watch.set_defaults(func=cmd_watch)
 
