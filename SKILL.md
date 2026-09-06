@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.1.1
+version: 0.1.2
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
@@ -67,6 +67,17 @@ orca-team start --same-tab --objective "Ship feature X"
 # or: --layout split --split-direction horizontal
 ```
 
+### Background watch (default on)
+
+`start` launches a detached `orca-team watch` process that nudges idle/stale workers missing `worker_done`. `stop` kills it.
+
+```bash
+orca-team start --same-tab --objective "Ship feature X"          # watch on
+orca-team start --same-tab --no-watch --objective "Ship feature X" # disable
+orca-team start --watch-interval 45 --watch-stale-minutes 10
+orca-team status   # shows watch pid alive/dead + log path
+```
+
 By default `start` auto-opens the team tab **on the host Orca UI**:
 
 1. `orca open` (ensure app/runtime)
@@ -111,7 +122,7 @@ Prefer grok and pi for implementation. Minimize sonnet — same Claude quota as 
 
 Workers must always `worker_done` / `ask` / `result` — orchestrator cannot see their TUI.
 
-Monitor / nudge stale dispatches:
+`start` enables a background watch by default. Manual / extra monitors:
 
 ```bash
 orca-team watch --once --idle-check

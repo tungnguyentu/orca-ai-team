@@ -67,7 +67,8 @@ orca-team doctor
 orca-team start --same-tab --objective "<goal>"
 orca-team status
 orca-team open                 # host focus + remote-viewer hints
-orca-team watch --once --idle-check   # find stale dispatches; nudge workers
+# start enables background watch by default (--no-watch to disable)
+orca-team watch --once --idle-check   # extra one-shot nudge
 orca-team watch --interval 60 --stale-minutes 10 --idle-check
 orca-team reinject             # re-send role prompts
 orca-team reinject --orchestrator-only

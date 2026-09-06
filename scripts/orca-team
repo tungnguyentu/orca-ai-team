@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -16,6 +17,9 @@ from typing import Any
 
 STATE_DIRNAME = ".orca"
 STATE_FILENAME = "ai-team.json"
+WATCH_LOG_FILENAME = "ai-team-watch.log"
+DEFAULT_WATCH_INTERVAL = 60
+DEFAULT_WATCH_STALE_MINUTES = 15.0
 DEFAULT_ORCHESTRATOR = "claude-opus"
 # command-code is omitted from room pre-open: it rewrites argv + runs onboarding,
 # so Orca inject/prompts often stall. Spawn it on demand via worker-start --agent.
@@ -240,6 +244,10 @@ def state_path_for(worktree_path: Path) -> Path:
     return worktree_path / STATE_DIRNAME / STATE_FILENAME
 
 
+def watch_log_path_for(worktree_path: Path) -> Path:
+    return worktree_path / STATE_DIRNAME / WATCH_LOG_FILENAME
+
+
 def load_state(worktree_path: Path) -> dict[str, Any] | None:
     path = state_path_for(worktree_path)
     if not path.is_file():
@@ -255,6 +263,146 @@ def save_state(worktree_path: Path, state: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2) + "\n")
     return path
+
+
+def pid_alive(pid: int) -> bool:
+    """True if pid exists and is not a zombie."""
+    if pid <= 0:
+        return False
+    # Prefer /proc so zombies count as dead (kill(0) still succeeds on zombies).
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        state = stat.split(")", 1)[1].lstrip().split(" ", 1)[0]
+        return state != "Z"
+    except FileNotFoundError:
+        return False
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    """Signal a detached watch process; prefer process group (start_new_session)."""
+    try:
+        os.killpg(pid, sig)
+        return
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        pass
+    os.kill(pid, sig)
+
+
+def stop_watch_process(state: dict[str, Any] | None) -> bool:
+    """SIGTERM (then SIGKILL) the background watch pid recorded in state. Returns True if a live pid was targeted."""
+    if not state:
+        return False
+    raw = state.get("watchPid")
+    if raw is None or raw == "":
+        return False
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        state["watchPid"] = None
+        return False
+    if not pid_alive(pid):
+        state["watchPid"] = None
+        state["watchStoppedAt"] = utc_now()
+        return False
+    try:
+        _signal_pid(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        state["watchPid"] = None
+        state["watchStoppedAt"] = utc_now()
+        return False
+    for _ in range(50):
+        if not pid_alive(pid):
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            _signal_pid(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for _ in range(20):
+            if not pid_alive(pid):
+                break
+            time.sleep(0.05)
+    state["watchPid"] = None
+    state["watchStoppedAt"] = utc_now()
+    return True
+
+
+def start_background_watch(
+    worktree_path: Path,
+    *,
+    interval: int = DEFAULT_WATCH_INTERVAL,
+    stale_minutes: float = DEFAULT_WATCH_STALE_MINUTES,
+    idle_check: bool = True,
+) -> dict[str, Any]:
+    """Detach `orca-team watch` in the worktree; log to `.orca/ai-team-watch.log`."""
+    script = Path(__file__).resolve()
+    log_path = watch_log_path_for(worktree_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable,
+        "-u",
+        str(script),
+        "watch",
+        "--interval",
+        str(max(15, int(interval))),
+        "--stale-minutes",
+        str(stale_minutes),
+    ]
+    if idle_check:
+        cmd.append("--idle-check")
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    with open(log_path, "a", encoding="utf-8") as log_fh:
+        log_fh.write(f"\n--- watch start {utc_now()} pid=pending ---\n")
+        log_fh.write(f"cmd: {' '.join(cmd)}\n")
+        log_fh.flush()
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(worktree_path),
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+    # Append pid after spawn (best-effort; child already has the open fd).
+    try:
+        with open(log_path, "a", encoding="utf-8") as log_fh:
+            log_fh.write(f"--- watch pid {proc.pid} ---\n")
+    except OSError:
+        pass
+    return {
+        "pid": proc.pid,
+        "log": str(log_path),
+        "interval": max(15, int(interval)),
+        "staleMinutes": float(stale_minutes),
+        "idleCheck": bool(idle_check),
+        "cmd": cmd,
+    }
+
+
+def team_still_running(worktree_path: Path, run_id: str) -> bool:
+    state = load_state(worktree_path)
+    if not state or state.get("status") != "running":
+        return False
+    if run_id and str(state.get("runId") or "") != run_id:
+        return False
+    return True
 
 
 def load_role_templates() -> dict[str, str]:
@@ -847,12 +995,19 @@ def cmd_start(args: argparse.Namespace) -> int:
             f"team already running in {worktree_path} (run {existing.get('runId')}).\n"
             "Use `orca-team status`, `orca-team stop`, or pass --force."
         )
+    if existing:
+        # Drop any leftover watchdog from a previous/forced start.
+        old_watch_pid = existing.get("watchPid")
+        if stop_watch_process(existing):
+            print(f"  stopped previous watch pid {old_watch_pid}")
+            save_state(worktree_path, existing)
 
     orchestrator = args.orchestrator
     workers = parse_agent_list(args.workers, DEFAULT_WORKERS)
     if orchestrator in workers:
         workers = [w for w in workers if w != orchestrator]
     objective = args.objective or "Coordinate the AI team on the current worktree objective"
+    enable_watch = bool(getattr(args, "watch", True))
 
     # Ensure binaries exist for requested agents.
     for agent_id in [orchestrator, *workers]:
@@ -870,6 +1025,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     print(f"  orchestrator: {orchestrator} → `{launch_command(orchestrator)}`")
     print(f"  workers: {', '.join(workers) if workers else '(none)'}")
     print(f"  layout: {layout}" + (f" ({split_direction})" if layout == "split" else ""))
+    print(f"  watch: {'on' if enable_watch else 'off'}")
     print(f"  objective: {objective}")
 
     if is_claude_agent(orchestrator) or any(is_claude_agent(w) for w in workers):
@@ -1161,8 +1317,37 @@ def cmd_start(args: argparse.Namespace) -> int:
         "orcaCli": orca,
         "members": members,
         "tasks": tasks,
+        "watchEnabled": enable_watch,
+        "watchPid": None,
+        "watchLog": None,
     }
     path = save_state(worktree_path, state)
+
+    if enable_watch:
+        try:
+            watch_info = start_background_watch(
+                worktree_path,
+                interval=int(getattr(args, "watch_interval", DEFAULT_WATCH_INTERVAL)),
+                stale_minutes=float(
+                    getattr(args, "watch_stale_minutes", DEFAULT_WATCH_STALE_MINUTES)
+                ),
+                idle_check=True,
+            )
+            state["watchPid"] = watch_info["pid"]
+            state["watchLog"] = watch_info["log"]
+            state["watchInterval"] = watch_info["interval"]
+            state["watchStaleMinutes"] = watch_info["staleMinutes"]
+            state["watchStartedAt"] = utc_now()
+            path = save_state(worktree_path, state)
+            print(
+                f"  watch: pid {watch_info['pid']} "
+                f"(every {watch_info['interval']}s, stale>{watch_info['staleMinutes']}m, idle-check) "
+                f"log {watch_info['log']}"
+            )
+        except OSError as exc:
+            eprint(f"warning: could not start background watch: {exc}")
+            state["watchEnabled"] = False
+            save_state(worktree_path, state)
 
     # Best-effort worktree comment — visible on remote worktree cards.
     try:
@@ -1198,6 +1383,10 @@ def cmd_start(args: argparse.Namespace) -> int:
     print(f"  runId:    {run_id}")
     print(f"  layout:   {layout}")
     print(f"  state:    {path}")
+    if state.get("watchPid"):
+        print(f"  watch:    pid {state['watchPid']} (auto; disable with --no-watch)")
+    elif not enable_watch:
+        print("  watch:    off (--no-watch)")
     if layout == "split":
         print(f"  next:     open worktree + tab '{tab_title}' (split panes: all agents)")
     else:
@@ -1611,6 +1800,20 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  runId:     {state.get('runId')}")
     print(f"  objective: {state.get('objective')}")
     print(f"  startedAt: {state.get('startedAt')}")
+    watch_pid = state.get("watchPid")
+    if watch_pid:
+        try:
+            alive = pid_alive(int(watch_pid))
+        except (TypeError, ValueError):
+            alive = False
+        print(
+            f"  watch:     pid {watch_pid} [{'alive' if alive else 'dead'}] "
+            f"log={state.get('watchLog') or watch_log_path_for(worktree_path)}"
+        )
+    elif state.get("watchEnabled") is False:
+        print("  watch:     off")
+    else:
+        print("  watch:     (none)")
     print("  members:")
     live = orca_json(
         orca,
@@ -1718,6 +1921,12 @@ def cmd_stop(args: argparse.Namespace) -> int:
     errors = []
     layout = state.get("layout") or "tabs"
     members = list(state.get("members") or [])
+
+    old_watch_pid = state.get("watchPid")
+    if stop_watch_process(state):
+        print(f"  stopped watch pid {old_watch_pid}")
+    elif old_watch_pid:
+        print(f"  watch pid {old_watch_pid} already dead")
 
     # Same-tab layout: one --tab close removes every pane. Avoid closing N times.
     if layout == "split" and not args.keep_orchestrator:
@@ -1898,6 +2107,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
     )
 
     for round_idx in range(rounds):
+        if not team_still_running(worktree_path, run_id):
+            print(f"[{utc_now()}] team stopped or run changed; watch exiting")
+            return 0
         now = datetime.now(timezone.utc)
         tasks = list_dispatched_tasks(orca, run_id=run_id, orch_handle=orch_handle)
         if not tasks:
@@ -2008,7 +2220,15 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
         if args.once or round_idx + 1 >= rounds:
             break
-        time.sleep(interval)
+        # Sleep in chunks so stop can be noticed quickly.
+        slept = 0
+        while slept < interval:
+            if not team_still_running(worktree_path, run_id):
+                print(f"[{utc_now()}] team stopped or run changed; watch exiting")
+                return 0
+            step = min(5, interval - slept)
+            time.sleep(step)
+            slept += step
 
     return 0
 
@@ -2066,6 +2286,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-open",
         action="store_true",
         help="Do not auto-focus/switch to the team tab in the Orca UI (default: open)",
+    )
+    start.add_argument(
+        "--watch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Background worker watchdog after start (default: on). "
+            "Nudges idle/stale workers missing worker_done. Use --no-watch to disable."
+        ),
+    )
+    start.add_argument(
+        "--watch-interval",
+        type=int,
+        default=DEFAULT_WATCH_INTERVAL,
+        help=f"Seconds between auto-watch scans (default: {DEFAULT_WATCH_INTERVAL})",
+    )
+    start.add_argument(
+        "--watch-stale-minutes",
+        type=float,
+        default=DEFAULT_WATCH_STALE_MINUTES,
+        help=f"Auto-watch stale threshold in minutes (default: {DEFAULT_WATCH_STALE_MINUTES})",
     )
     start.set_defaults(func=cmd_start)
 

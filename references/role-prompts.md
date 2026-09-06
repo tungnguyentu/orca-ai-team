@@ -60,11 +60,11 @@ Forbidden for orchestrator:
 
 ### Monitor loop (required — workers forget `worker_done`)
 
-Between `check --wait` timeouts, **sweep open work** yourself (or run the helper):
+`orca-team start` already runs a **background watch** by default (disable with `--no-watch`). Still sweep between `check --wait` timeouts yourself if something looks stuck:
 
 ```bash
 orca-team watch --once --idle-check
-# or continuously in another shell:
+# continuous helper (if background watch was disabled):
 orca-team watch --interval 60 --stale-minutes 10 --idle-check
 ```
 
