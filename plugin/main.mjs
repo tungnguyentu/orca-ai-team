@@ -2,7 +2,8 @@
 // Activated on first command/event. Types `orca-team start ...` into a
 // focused worktree terminal via the capability-gated host API.
 
-function buildStartCommand({ sameTab = true, objective = '' } = {}) {
+function buildStartCommand({ sameTab = false, objective = '' } = {}) {
+  // Default CLI layout is dual (orch tab + workers tab). Only pass --same-tab when asked.
   const parts = ['orca-team', 'start']
   if (sameTab) parts.push('--same-tab')
   const goal = typeof objective === 'string' ? objective.trim() : ''
@@ -33,7 +34,7 @@ async function pickTerminalId(orca, preferredId) {
 }
 
 async function startAiTeam(orca, args = {}) {
-  const sameTab = args?.sameTab !== false
+  const sameTab = Boolean(args?.sameTab)
   const objective = typeof args?.objective === 'string' ? args.objective : ''
   const preferredTerminalId =
     typeof args?.terminalId === 'string' ? args.terminalId : undefined

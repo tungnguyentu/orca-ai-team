@@ -20,6 +20,10 @@ STATE_FILENAME = "ai-team.json"
 WATCH_LOG_FILENAME = "ai-team-watch.log"
 DEFAULT_WATCH_INTERVAL = 60
 DEFAULT_WATCH_STALE_MINUTES = 15.0
+# Layout: dual = orchestrator alone in one tab, all workers split in a second tab.
+DEFAULT_LAYOUT = "dual"
+ORCH_TAB_TITLE = "ai-team:orch"
+WORKERS_TAB_TITLE = "ai-team:workers"
 DEFAULT_ORCHESTRATOR = "claude-opus"
 # command-code is omitted from room pre-open: it rewrites argv + runs onboarding,
 # so Orca inject/prompts often stall. Spawn it on demand via worker-start --agent.
@@ -246,6 +250,18 @@ def state_path_for(worktree_path: Path) -> Path:
 
 def watch_log_path_for(worktree_path: Path) -> Path:
     return worktree_path / STATE_DIRNAME / WATCH_LOG_FILENAME
+
+
+def delete_watch_log(worktree_path: Path) -> bool:
+    """Remove `.orca/ai-team-watch.log` if present. Returns True when a file was deleted."""
+    path = watch_log_path_for(worktree_path)
+    try:
+        if path.is_file():
+            path.unlink()
+            return True
+    except OSError as exc:
+        eprint(f"warning: could not delete watch log {path}: {exc}")
+    return False
 
 
 def load_state(worktree_path: Path) -> dict[str, Any] | None:
@@ -873,13 +889,48 @@ def raise_orca_desktop_window() -> bool:
     return False
 
 
-def print_remote_open_help(*, worktree_path: Path, tab_title: str) -> None:
+def next_split_direction(split_direction: str, opened_index: int) -> str:
+    """Alternate split axes so panes tile instead of stacking on one axis."""
+    if opened_index <= 0:
+        return split_direction
+    if split_direction == "horizontal":
+        return "vertical" if opened_index % 2 == 1 else "horizontal"
+    return "horizontal" if opened_index % 2 == 1 else "vertical"
+
+
+def resolve_layout(args: argparse.Namespace) -> str:
+    if getattr(args, "same_tab", False):
+        return "split"
+    if getattr(args, "dual_tab", False):
+        return "dual"
+    return str(getattr(args, "layout", DEFAULT_LAYOUT) or DEFAULT_LAYOUT)
+
+
+def tab_titles_for_layout(layout: str, orchestrator: str) -> tuple[str, str | None]:
+    """Return (focus_tab_title, workers_tab_title_or_none)."""
+    if layout == "split":
+        return "ai-team", None
+    if layout == "dual":
+        return ORCH_TAB_TITLE, WORKERS_TAB_TITLE
+    return f"orchestrator:{orchestrator}", None
+
+
+def print_remote_open_help(
+    *,
+    worktree_path: Path,
+    tab_title: str,
+    workers_tab_title: str | None = None,
+) -> None:
     """Explain how to find the team when viewing via Orca remote from another machine."""
     print("  remote viewer:")
     print(f"    1. On the remote Orca client, open worktree card: {worktree_path.name}")
     print(f"       path: {worktree_path}")
-    print(f"    2. In that worktree's terminal strip, click tab titled exactly: {tab_title}")
-    print("    3. You should see split panes (orchestrator + workers)")
+    print(f"    2. Click tab titled exactly: {tab_title}")
+    if workers_tab_title:
+        print(f"       (workers are in a second tab titled: {workers_tab_title})")
+        print("    3. Orchestrator tab is alone; workers tab has split panes")
+    else:
+        print("    3. You should see the team panes in that tab")
     print("    note: `terminal switch` focuses the HOST Orca UI; remote viewers must")
     print("    select the worktree + tab manually (focus does not mirror over remote).")
 
@@ -1034,22 +1085,27 @@ def cmd_start(args: argparse.Namespace) -> int:
     templates = load_role_templates()
     members: list[dict[str, Any]] = []
 
-    layout = "split" if getattr(args, "same_tab", False) else args.layout
+    layout = resolve_layout(args)
     split_direction = args.split_direction
+    tab_title, workers_tab_title = tab_titles_for_layout(layout, orchestrator)
 
     print(f"Starting AI team in {worktree_path}")
     print(f"  orchestrator: {orchestrator} → `{launch_command(orchestrator)}`")
     print(f"  workers: {', '.join(workers) if workers else '(none)'}")
-    print(f"  layout: {layout}" + (f" ({split_direction})" if layout == "split" else ""))
+    layout_note = ""
+    if layout in {"split", "dual"}:
+        layout_note = f" ({split_direction})"
+    if layout == "dual":
+        layout_note += f" — tabs '{tab_title}' + '{workers_tab_title}'"
+    print(f"  layout: {layout}{layout_note}")
     print(f"  watch: {'on' if enable_watch else 'off'}")
     print(f"  objective: {objective}")
 
     if is_claude_agent(orchestrator) or any(is_claude_agent(w) for w in workers):
         ensure_claude_project_trust(worktree_path)
 
-    # 1) Orchestrator terminal (always a new tab — workers may join as splits)
+    # 1) Orchestrator terminal (always its own tab; dual/split/tabs differ for workers)
     # Keep a stable short title. Agent TUIs overwrite longer titles and confuse auto-open.
-    tab_title = "ai-team" if layout == "split" else f"orchestrator:{orchestrator}"
     open_tab = not getattr(args, "no_open", False)
     orch_term = create_terminal(
         orca,
@@ -1060,7 +1116,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     )
     orch_handle = orch_term["handle"]
     orch_tab_id = orch_term.get("tabId")
-    print(f"  created orchestrator terminal {orch_handle}")
+    print(f"  created orchestrator terminal {orch_handle} (tab '{tab_title}')")
     dismiss_startup_prompts(orca, orch_handle, agent_id=orchestrator)
     terminal_rename(orca, orch_handle, tab_title)
     members.append(
@@ -1091,9 +1147,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     run_id = run["id"]
     print(f"  run: {run_id}")
 
-    # 3) Worker terminals — new tabs, or panes in the orchestrator tab.
+    # 3) Worker terminals.
+    #   split  → panes in the orchestrator tab
+    #   dual   → one shared workers tab (first worker creates it; rest split in)
+    #   tabs   → one tab per worker
     # Deferred agents (e.g. command-code) are roster-only until worker-start --agent.
     split_anchor = orch_handle
+    workers_tab_id: str | None = None
+    workers_tab_handle: str | None = None
     opened_index = 0
     for agent_id in workers:
         if agent_id in DEFERRED_AGENTS:
@@ -1110,7 +1171,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                     "handle": None,
                     "deferred": True,
                     "launchCommand": launch_command(agent_id),
-                    "tabId": orch_tab_id,
+                    "tabId": workers_tab_id if layout == "dual" else orch_tab_id,
                     "paneKey": None,
                     "spawnHint": (
                         f"orca orchestration worker-start --task <task_id> "
@@ -1121,11 +1182,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             continue
 
         if layout == "split":
-            direction = split_direction
-            if opened_index > 0 and split_direction == "horizontal":
-                direction = "vertical" if opened_index % 2 == 1 else "horizontal"
-            elif opened_index > 0 and split_direction == "vertical":
-                direction = "horizontal" if opened_index % 2 == 1 else "vertical"
+            direction = next_split_direction(split_direction, opened_index)
             term = split_terminal(
                 orca,
                 from_handle=split_anchor,
@@ -1135,8 +1192,39 @@ def cmd_start(args: argparse.Namespace) -> int:
             handle = term["handle"]
             print(
                 f"  split worker:{agent_id} pane {handle} "
-                f"(same tab, {direction} from {split_anchor})"
+                f"(orch tab, {direction} from {split_anchor})"
             )
+            split_anchor = handle
+        elif layout == "dual":
+            if workers_tab_handle is None:
+                assert workers_tab_title is not None
+                term = create_terminal(
+                    orca,
+                    title=workers_tab_title,
+                    command=launch_command(agent_id),
+                    worktree_selector=selector,
+                )
+                handle = term["handle"]
+                workers_tab_handle = handle
+                workers_tab_id = term.get("tabId")
+                terminal_rename(orca, handle, workers_tab_title)
+                print(
+                    f"  created workers tab '{workers_tab_title}' "
+                    f"with worker:{agent_id} ({handle})"
+                )
+            else:
+                direction = next_split_direction(split_direction, opened_index)
+                term = split_terminal(
+                    orca,
+                    from_handle=split_anchor,
+                    command=launch_command(agent_id),
+                    direction=direction,
+                )
+                handle = term["handle"]
+                print(
+                    f"  split worker:{agent_id} pane {handle} "
+                    f"(workers tab, {direction})"
+                )
             split_anchor = handle
         else:
             term = create_terminal(
@@ -1159,7 +1247,8 @@ def cmd_start(args: argparse.Namespace) -> int:
                 "handle": handle,
                 "deferred": False,
                 "launchCommand": launch_command(agent_id),
-                "tabId": term.get("tabId") or orch_tab_id,
+                "tabId": term.get("tabId")
+                or (workers_tab_id if layout == "dual" else orch_tab_id),
                 "paneKey": term.get("paneKey"),
             }
         )
@@ -1325,7 +1414,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         "startedAt": utc_now(),
         "mode": args.mode,
         "layout": layout,
-        "splitDirection": split_direction if layout == "split" else None,
+        "splitDirection": split_direction if layout in {"split", "dual"} else None,
+        "orchTabTitle": tab_title,
+        "workersTabTitle": workers_tab_title,
+        "workersTabHandle": workers_tab_handle,
         "objective": objective,
         "runId": run_id,
         "worktreeId": worktree_id,
@@ -1371,7 +1463,11 @@ def cmd_start(args: argparse.Namespace) -> int:
                 "--worktree",
                 selector,
                 "--comment",
-                f'ai-team LIVE — open terminal tab "{tab_title}" ({orchestrator}+{len(workers)}, {layout})',
+                (
+                    f'ai-team LIVE — orch tab "{tab_title}"'
+                    + (f' + workers tab "{workers_tab_title}"' if workers_tab_title else "")
+                    + f" ({orchestrator}+{len(workers)}, {layout})"
+                ),
             ],
             check=False,
         )
@@ -1389,7 +1485,11 @@ def cmd_start(args: argparse.Namespace) -> int:
                 f"  tip: run `orca-team open` or "
                 f"`orca terminal switch --terminal {orch_handle} --json`"
             )
-            print_remote_open_help(worktree_path=worktree_path, tab_title=tab_title)
+            print_remote_open_help(
+                worktree_path=worktree_path,
+                tab_title=tab_title,
+                workers_tab_title=workers_tab_title,
+            )
 
     print("\nTeam ready.")
     print(f"  runId:    {run_id}")
@@ -1408,8 +1508,11 @@ def cmd_start(args: argparse.Namespace) -> int:
         print("  watch:    off (--no-watch)")
     else:
         print("  watch:    failed to start (see warnings above)")
-    if layout == "split":
-        print(f"  next:     open worktree + tab '{tab_title}' (split panes: all agents)")
+    if layout == "dual":
+        print(f"  next:     tab '{tab_title}' (orchestrator alone)")
+        print(f"            tab '{workers_tab_title}' (all workers split)")
+    elif layout == "split":
+        print(f"  next:     open worktree + tab '{tab_title}' (all agents split)")
     else:
         print(f"  next:     talk to tab orchestrator:{orchestrator}")
     print("  open:     orca-team open   # host focus + remote instructions")
@@ -1487,10 +1590,18 @@ def cmd_open(args: argparse.Namespace) -> int:
     orch = next((m for m in state.get("members") or [] if m.get("role") == "orchestrator"), None)
     if not orch or not orch.get("handle"):
         raise TeamError("team state missing orchestrator handle")
-    layout = state.get("layout") or "tabs"
-    tab_title = "ai-team" if layout == "split" else f"orchestrator:{orch.get('agentId', 'agent')}"
+    layout = state.get("layout") or DEFAULT_LAYOUT
+    tab_title = state.get("orchTabTitle") or tab_titles_for_layout(
+        layout, str(orch.get("agentId") or "agent")
+    )[0]
+    workers_tab_title = state.get("workersTabTitle") or (
+        WORKERS_TAB_TITLE if layout == "dual" else None
+    )
     # Refresh card comment for remote findability.
     try:
+        comment = f'ai-team LIVE — open terminal tab "{tab_title}"'
+        if workers_tab_title:
+            comment += f' (workers: "{workers_tab_title}")'
         orca_json(
             orca,
             [
@@ -1499,7 +1610,7 @@ def cmd_open(args: argparse.Namespace) -> int:
                 "--worktree",
                 f"path:{worktree_path}",
                 "--comment",
-                f'ai-team LIVE — open terminal tab "{tab_title}"',
+                comment,
             ],
             check=False,
         )
@@ -1513,6 +1624,8 @@ def cmd_open(args: argparse.Namespace) -> int:
     ):
         raise TeamError(f"could not open team tab ({orch['handle']})")
     print(f"Host focused run {state.get('runId')} → tab '{tab_title}'")
+    if workers_tab_title:
+        print(f"  workers tab: '{workers_tab_title}'")
     return 0
 
 
@@ -1659,6 +1772,7 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
         }
     else:
         # Spawn a fresh orchestrator pane/tab.
+        # dual/tabs: always a dedicated orch tab. split: pane inside the shared tab.
         if layout == "split" and old_orch.get("handle"):
             term = split_terminal(
                 orca,
@@ -1668,13 +1782,14 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
             )
             print(f"  split new orchestrator pane {term['handle']}")
         else:
+            orch_title = state.get("orchTabTitle") or tab_titles_for_layout(layout, new_agent)[0]
             term = create_terminal(
                 orca,
-                title=f"orchestrator:{new_agent}",
+                title=orch_title,
                 command=launch_command(new_agent),
                 worktree_selector=selector,
             )
-            print(f"  created new orchestrator terminal {term['handle']}")
+            print(f"  created new orchestrator terminal {term['handle']} (tab '{orch_title}')")
         new_handle = str(term["handle"])
         dismiss_startup_prompts(orca, new_handle, agent_id=new_agent)
         new_member = {
@@ -1781,12 +1896,16 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
             ),
         )
 
-    tab_title = "ai-team" if layout == "split" else f"orchestrator:{new_agent}"
+    tab_title = state.get("orchTabTitle") or tab_titles_for_layout(layout, new_agent)[0]
+    workers_tab_title = state.get("workersTabTitle")
     terminal_rename(orca, new_handle, tab_title)
     if not args.no_open:
         reveal_team_tab(orca, new_handle, tab_title=tab_title, worktree_path=worktree_path)
 
     try:
+        comment = f'ai-team LIVE — orchestrator={new_agent} tab "{tab_title}"'
+        if workers_tab_title:
+            comment += f' (workers: "{workers_tab_title}")'
         orca_json(
             orca,
             [
@@ -1795,7 +1914,7 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
                 "--worktree",
                 selector,
                 "--comment",
-                f'ai-team LIVE — orchestrator={new_agent} tab "{tab_title}"',
+                comment,
             ],
             check=False,
         )
@@ -1950,25 +2069,48 @@ def cmd_stop(args: argparse.Namespace) -> int:
         print(f"  stopped watch pid {old_watch_pid}")
     elif old_watch_pid:
         print(f"  watch pid {old_watch_pid} already dead")
+    if delete_watch_log(worktree_path):
+        print(f"  deleted watch log {watch_log_path_for(worktree_path)}")
 
-    # Same-tab layout: one --tab close removes every pane. Avoid closing N times.
+    def _close_tab(handle: str, label: str) -> None:
+        payload = orca_json(
+            orca,
+            ["terminal", "close", "--terminal", handle, "--tab"],
+            check=False,
+        )
+        if payload.get("ok"):
+            closed.append(handle)
+            print(f"  closed {label} ({handle})")
+        else:
+            err = payload.get("error") or {}
+            errors.append(f"{handle}: {err.get('code')} {err.get('message')}")
+            eprint(f"  warning: could not close {label}: {err.get('message')}")
+
+    orch = next((m for m in members if m.get("role") == "orchestrator"), None)
+    first_worker = next(
+        (
+            m
+            for m in members
+            if m.get("role") == "worker" and m.get("handle") and not m.get("deferred")
+        ),
+        None,
+    )
+
+    # split: one shared tab. dual: orch tab + workers tab. Avoid closing N panes.
     if layout == "split" and not args.keep_orchestrator:
-        orch = next((m for m in members if m.get("role") == "orchestrator"), None)
         target = orch or (members[0] if members else None)
         if target and target.get("handle"):
-            payload = orca_json(
-                orca,
-                ["terminal", "close", "--terminal", target["handle"], "--tab"],
-                check=False,
-            )
-            if payload.get("ok"):
-                closed.append(target["handle"])
-                print(f"  closed shared team tab via {target.get('title')} ({target['handle']})")
-            else:
-                err = payload.get("error") or {}
-                errors.append(f"{target['handle']}: {err.get('code')} {err.get('message')}")
-                eprint(f"  warning: could not close team tab: {err.get('message')}")
-        members = []  # skip per-pane loop
+            _close_tab(str(target["handle"]), f"shared team tab via {target.get('title')}")
+        members = []
+    elif layout == "dual":
+        if not args.keep_orchestrator and orch and orch.get("handle"):
+            _close_tab(str(orch["handle"]), f"orchestrator tab via {orch.get('title')}")
+        workers_handle = state.get("workersTabHandle") or (
+            first_worker.get("handle") if first_worker else None
+        )
+        if workers_handle:
+            _close_tab(str(workers_handle), "workers tab")
+        members = []  # both tabs closed (or workers-only when keep_orchestrator)
 
     for member in members:
         handle = member.get("handle")
@@ -1978,7 +2120,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
             continue
         # In split+keep-orchestrator, close only worker panes (no --tab).
         close_args = ["terminal", "close", "--terminal", handle]
-        if layout != "split":
+        if layout not in {"split", "dual"}:
             close_args.append("--tab")
         payload = orca_json(orca, close_args, check=False)
         if payload.get("ok"):
@@ -1992,6 +2134,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     state["status"] = "stopped"
     state["stoppedAt"] = utc_now()
     state["closedHandles"] = closed
+    state["watchLog"] = None
     save_state(worktree_path, state)
 
     try:
@@ -2312,9 +2455,17 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--task", default="", help="With --mode supervise, task spec for each worker")
     start.add_argument(
         "--layout",
-        choices=["tabs", "split"],
-        default="tabs",
-        help="tabs = one tab per agent (default); split = all agents as panes in one tab",
+        choices=["dual", "split", "tabs"],
+        default=DEFAULT_LAYOUT,
+        help=(
+            "dual = orchestrator tab + shared workers tab (default); "
+            "split = all agents in one tab; tabs = one tab per agent"
+        ),
+    )
+    start.add_argument(
+        "--dual-tab",
+        action="store_true",
+        help="Alias for --layout dual (orchestrator alone; all workers in one tab)",
     )
     start.add_argument(
         "--same-tab",
@@ -2325,7 +2476,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-direction",
         choices=["horizontal", "vertical"],
         default="horizontal",
-        help="Initial split direction when --layout split / --same-tab (default: horizontal)",
+        help="Split direction for --layout dual/split (default: horizontal)",
     )
     start.add_argument("--force", action="store_true", help="Start even if ai-team.json says running")
     start.add_argument(

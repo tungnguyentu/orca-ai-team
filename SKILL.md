@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.1.4
+version: 0.1.5
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
@@ -33,12 +33,13 @@ orca-team start --objective "Ship feature X"
 # defaults:
 #   orchestrator = claude-opus
 #   workers      = claude-sonnet,grok,pi
+#   layout       = dual  (orch tab alone + workers tab)
 #   (command-code is deferred — spawn via worker-start --agent command-code)
 
-# Talk in the orchestrator tab inside Orca.
+# Talk in the orchestrator tab (`ai-team:orch`) inside Orca.
 orca-team status
 orca-team send --to run --subject "standup" --body "Status check"
-orca-team stop
+orca-team stop   # also deletes .orca/ai-team-watch.log
 ```
 
 Custom roster:
@@ -48,6 +49,20 @@ orca-team start \
   --orchestrator claude-opus \
   --workers claude-sonnet,grok,pi,command-code \
   --objective "Build auth"
+```
+
+### Layouts
+
+| flag | tabs |
+|------|------|
+| `--layout dual` (default) / `--dual-tab` | `ai-team:orch` (orchestrator alone) + `ai-team:workers` (all workers split) |
+| `--layout split` / `--same-tab` | one tab `ai-team` with every agent as panes |
+| `--layout tabs` | one tab per agent |
+
+```bash
+orca-team start --objective "Ship feature X"                 # dual (default)
+orca-team start --same-tab --objective "Ship feature X"      # everything in one tab
+orca-team start --layout tabs --objective "Ship feature X"   # one tab each
 ```
 
 ### Swap orchestrator when someone hits a limit
@@ -60,28 +75,21 @@ orca-team set-orchestrator --agent grok --reason "claude limited" --fresh
 orca-team set-orchestrator --agent claude-sonnet --reason "limit" --close-old
 ```
 
-Same tab (panes / splits instead of one tab per agent):
-
-```bash
-orca-team start --same-tab --objective "Ship feature X"
-# or: --layout split --split-direction horizontal
-```
-
 ### Background watch (default on)
 
-`start` launches a detached `orca-team watch` process that nudges idle/stale workers missing `worker_done`. `stop` kills it.
+`start` launches a detached `orca-team watch` process that nudges idle/stale workers missing `worker_done`. `stop` kills it **and deletes** `.orca/ai-team-watch.log`.
 
 ```bash
-orca-team start --same-tab --objective "Ship feature X"          # watch on
-orca-team start --same-tab --no-watch --objective "Ship feature X" # disable
+orca-team start --objective "Ship feature X"          # watch on
+orca-team start --no-watch --objective "Ship feature X" # disable
 orca-team start --watch-interval 45 --watch-stale-minutes 10
 orca-team status   # shows watch pid alive/dead + log path
 ```
 
-By default `start` auto-opens the team tab **on the host Orca UI**:
+By default `start` auto-opens the orchestrator tab **on the host Orca UI**:
 
 1. `orca open` (ensure app/runtime)
-2. rename tab to stable title `ai-team` (agents overwrite titles otherwise)
+2. rename tabs to stable titles (`ai-team:orch`, `ai-team:workers`)
 3. `orca terminal switch` onto the orchestrator handle
 4. best-effort raise of the host Orca desktop window (Hyprland/`xdotool`)
 5. set the worktree card comment so remote viewers can find it
@@ -96,11 +104,9 @@ orca-team open
 
 `terminal switch` only focuses the **host** Orca window. Remote/shared-control clients do **not** automatically jump to that tab. From the remote machine:
 
-1. Open the worktree card (comment says `ai-team LIVE — open terminal tab "ai-team"`)
-2. Click the terminal tab titled exactly **`ai-team`**
-3. You should see the split panes (orchestrator + workers)
-
-Ignore leftover single tabs named `ai-team:claude` from older runs.
+1. Open the worktree card (comment mentions `ai-team:orch` / `ai-team:workers`)
+2. Click **`ai-team:orch`** for the orchestrator, or **`ai-team:workers`** for the worker panes
+3. Ignore leftover single tabs named `ai-team:claude` from older runs
 
 ### Orchestrator keeps coding instead of delegating
 
@@ -167,11 +173,11 @@ orca-team start --mode supervise --task "Implement the agreed plan" --objective 
 
 1. Resolves Orca CLI (`ORCA_CLI_COMMAND` → `orca-ide` on Linux outside managed terminals → `orca`)
 2. Requires current directory to be an Orca worktree
-3. Creates `orchestrator:<agent>` terminal with skip-permission launch
+3. Creates orchestrator tab (`ai-team:orch` in dual layout) with skip-permission launch
 4. `orchestration run-create --from <orchestrator>`
-5. Creates each `worker:<agent>` terminal
+5. Creates worker panes (shared `ai-team:workers` tab in dual layout)
 6. Injects role prompts from `references/role-prompts.md`
-7. Writes `.orca/ai-team.json`
+7. Writes `.orca/ai-team.json` and starts background watch (unless `--no-watch`)
 
 Agents coordinate with:
 

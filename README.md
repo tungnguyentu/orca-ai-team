@@ -1,6 +1,6 @@
 # orca-ai-team
 
-**Version:** `0.1.4` (see [`VERSION`](./VERSION))
+**Version:** `0.1.5` (see [`VERSION`](./VERSION))
 
 Orca multi-agent team room launcher + skill.
 
@@ -46,9 +46,11 @@ ln -sfn "$PWD" ~/.grok/skills/orca-ai-team
 ```bash
 cd /path/to/orca-managed-worktree
 orca-team doctor
-orca-team start --same-tab --objective "Ship feature X"
+orca-team start --objective "Ship feature X"
 # defaults: orchestrator=claude-opus, workers=claude-sonnet,grok,pi
+# layout=dual → tab ai-team:orch + tab ai-team:workers
 # command-code is deferred (spawn on demand via worker-start --agent command-code)
+# --same-tab = everything in one tab; --layout tabs = one tab per agent
 
 orca-team status
 orca-team open
@@ -56,7 +58,7 @@ orca-team open
 orca-team watch --once --idle-check   # extra one-shot nudge
 orca-team reinject --orchestrator-only
 orca-team set-orchestrator --agent claude-sonnet --reason "opus rate limit"
-orca-team stop
+orca-team stop   # closes tabs + deletes .orca/ai-team-watch.log
 ```
 
 Requires Orca runtime with Experimental → orchestration enabled.

@@ -64,7 +64,7 @@ From inside an Orca worktree:
 
 ```bash
 orca-team doctor
-orca-team start --same-tab --objective "<goal>"
+orca-team start --objective "<goal>"   # dual layout by default
 orca-team status
 orca-team open                 # host focus + remote-viewer hints
 # start enables background watch by default (--no-watch to disable)
@@ -74,19 +74,20 @@ orca-team reinject             # re-send role prompts
 orca-team reinject --orchestrator-only
 orca-team set-orchestrator --agent claude-sonnet --reason "opus rate limit"
 orca-team send --to run --subject "..." --body "..."
-orca-team stop
+orca-team stop                 # closes tabs + deletes watch log
 ```
 
 ### Layout
 
-- `--same-tab` / `--layout split` — all agents as panes in one tab titled `ai-team` (recommended)
-- `--layout tabs` — one tab per agent (default historically; prefer split)
+- `--layout dual` / `--dual-tab` (**default**) — orchestrator alone in `ai-team:orch`; all workers split in `ai-team:workers`
+- `--same-tab` / `--layout split` — all agents as panes in one tab titled `ai-team`
+- `--layout tabs` — one tab per agent
 
 Never pass `terminal create --focus` for auto-open; it can time out. Create, then `terminal switch`.
 
 ### Remote Orca viewers
 
-`terminal switch` focuses the **host** UI only. Remote clients must manually open the worktree card and click tab **`ai-team`**. Card comment is set to `ai-team LIVE — open terminal tab "ai-team"`.
+`terminal switch` focuses the **host** UI only. Remote clients must manually open the worktree card and click **`ai-team:orch`** (or **`ai-team:workers`**).
 
 ## Role contract (critical)
 
