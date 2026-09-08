@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.2.0
+version: 0.3.0
 
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
@@ -30,12 +30,16 @@ From inside an Orca-managed worktree:
 
 ```bash
 orca-team doctor
+orca-team config init
+orca-team config set --orchestrator claude-opus --workers claude-sonnet,grok,pi
 orca-team start --objective "Ship feature X"
-# defaults:
+# defaults from ~/.config/orca-ai-team/config.json (else built-ins):
 #   orchestrator = claude-opus
 #   workers      = claude-sonnet,grok,pi
 #   layout       = dual  (orch tab alone + workers tab)
 #   (command-code is deferred — spawn via worker-start --agent command-code)
+# per-run overrides: --orchestrator / --workers / --orchestrator-model / --worker-models
+# persist this run's roster: --save-defaults
 
 # Talk in the orchestrator tab (`ai-team:orch`) inside Orca.
 orca-team status

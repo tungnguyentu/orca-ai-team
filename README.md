@@ -1,6 +1,6 @@
 # orca-ai-team
 
-**Version:** `0.2.0` (see [`VERSION`](./VERSION))
+**Version:** `0.3.0` (see [`VERSION`](./VERSION))
 
 Orca multi-agent team room launcher + skill.
 
@@ -46,11 +46,14 @@ ln -sfn "$PWD" ~/.grok/skills/orca-ai-team
 ```bash
 cd /path/to/orca-managed-worktree
 orca-team doctor
+orca-team config init           # ~/.config/orca-ai-team/config.json
+orca-team config set --orchestrator grok --workers pi,claude-sonnet --model pi=openai/gpt-4o
 orca-team start --objective "Ship feature X"
-# defaults: orchestrator=claude-opus, workers=claude-sonnet,grok,pi
+# defaults from config (else built-ins: orch=claude-opus, workers=claude-sonnet,grok,pi)
 # layout=dual → tab ai-team:orch + tab ai-team:workers
 # command-code is deferred (spawn on demand via worker-start --agent command-code)
 # --same-tab = everything in one tab; --layout tabs = one tab per agent
+# --orchestrator-model / --worker-models agent=model / --save-defaults
 
 orca-team status
 orca-team usage                 # skip assign if grok/claude remaining is low
