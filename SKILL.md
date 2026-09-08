@@ -1,6 +1,7 @@
 ---
 name: orca-ai-team
-version: 0.1.9
+version: 0.2.0
+
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
   workers (Claude/Grok/Pi/command-code/Codex) that talk through Orca
@@ -38,10 +39,17 @@ orca-team start --objective "Ship feature X"
 
 # Talk in the orchestrator tab (`ai-team:orch`) inside Orca.
 orca-team status
+orca-team usage                 # probe grok/claude remaining % before assign
+orca-team assign --worker pi --spec "Implement X" --done "tests pass"
+# lean path: full worker role once per fresh pane; later tasks = short card (no fat --inject)
 orca-team send --to run --subject "standup" --body "Status check"
 orca-team stop   # writes AI-TEAM-HANDOFF.md + deletes watch log
 # next start loads AI-TEAM-HANDOFF.md into the orchestrator automatically
 ```
+
+Prefer `orca-team assign` for roster workers (send-once role + short `[orca-team lean-assign]` card). Avoid re-pasting the full worker bible or `dispatch --inject` on primed panes.
+
+`start` skips opening workers under `--min-remaining` (default 10%). Example: grok at 4% left is deferred (no pane) until quota recovers. Orchestrator must also run `orca-team usage` before dispatching.
 
 Custom roster:
 

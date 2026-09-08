@@ -7,7 +7,7 @@ Instructions for AI coding agents working in or on this repository.
 Thin **Orca multi-agent team room** launcher + skill. It does **not** invent a messaging bus. Coordination uses native Orca orchestration:
 
 - `orca orchestration run-create|run-use|send|check|ask|reply`
-- `orca orchestration task-create` + `worker-start` / `dispatch --inject`
+- `orca orchestration task-create` + lean `orca-team assign` (preferred) / `worker-start` for fresh panes
 
 One **orchestrator** plans and dispatches; **workers** implement.
 
@@ -66,11 +66,14 @@ From inside an Orca worktree:
 orca-team doctor
 orca-team start --objective "<goal>"   # dual layout by default
 orca-team status
+orca-team usage                # remaining % for grok/claude; LOW ⇒ do not assign
+orca-team assign --worker pi --spec "…" --done "…"   # lean: role once + short card
 orca-team open                 # host focus + remote-viewer hints
 # start enables background watch by default (--no-watch to disable)
+# start defers workers below --min-remaining (default 10%)
 orca-team watch --once --idle-check   # extra one-shot nudge
 orca-team watch --interval 60 --stale-minutes 10 --idle-check
-orca-team reinject             # re-send role prompts
+orca-team reinject             # workers get short reminder; --force-role for full bible
 orca-team reinject --orchestrator-only
 orca-team set-orchestrator --agent claude-sonnet --reason "opus rate limit"
 orca-team send --to run --subject "..." --body "..."
@@ -97,10 +100,11 @@ Source of truth: `references/role-prompts.md`.
 
 - **Plans, splits, dispatches, answers `ask`, synthesizes.**
 - **Must not** implement product code / “just quickly fix it”.
-- Assign with `task-create` + `worker-start --agent <id>` (preferred) or `--terminal` / `dispatch --inject`.
+- Assign with **`orca-team assign --worker <id> --spec "…"`** for primed roster panes (send-once role; short card; no fat `--inject`). Use `worker-start --agent` only for fresh/deferred panes.
 - Wait with `check --wait --types worker_done,escalation,question`.
 - **Answer worker `ask` / `question` immediately** (`reply`) — highest priority. An unanswered ask freezes that worker.
 - **Never claim a worker is quiet / missing `worker_done` without `check` + `dispatch-show`.** Watchdog idle after a real `worker_done` is normal; `dispatch-show` null means settled.
+- **Check `orca-team usage` before assign/open.** If grok/claude remaining is low (e.g. &lt;10%), do not dispatch or `worker-start` that agent — pick another healthy worker.
 - **Never invent a human-approval gate.** Dispatch in the same turn as the split unless the human explicitly said to wait. Idle workers = orchestrator failure — do not claim “I’m the bottleneck / pending your approval.”
 
 **Load balance + Claude quota:** Opus (orchestrator) and Sonnet share one Claude usage pool. Prefer **`grok` / `pi` / `command-code`** for most implementation; use **Sonnet sparingly** (≤ ~20–25% of tasks) unless the work needs Claude-specific skills. Round-robin across non-Claude workers; prefer the idle worker with the fewest assignments so far.

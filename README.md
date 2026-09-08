@@ -1,6 +1,6 @@
 # orca-ai-team
 
-**Version:** `0.1.9` (see [`VERSION`](./VERSION))
+**Version:** `0.2.0` (see [`VERSION`](./VERSION))
 
 Orca multi-agent team room launcher + skill.
 
@@ -53,8 +53,12 @@ orca-team start --objective "Ship feature X"
 # --same-tab = everything in one tab; --layout tabs = one tab per agent
 
 orca-team status
+orca-team usage                 # skip assign if grok/claude remaining is low
+orca-team assign --worker pi --spec "Implement X" --done "tests pass"
+# lean: full worker role once per fresh pane; later tasks = short card (no fat --inject)
 orca-team open
 # start already runs background watch by default; --no-watch to disable
+# start skips workers below --min-remaining (default 10%)
 orca-team watch --once --idle-check   # extra one-shot nudge
 orca-team reinject --orchestrator-only
 orca-team set-orchestrator --agent claude-sonnet --reason "opus rate limit"

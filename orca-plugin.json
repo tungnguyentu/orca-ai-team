@@ -3,14 +3,16 @@
   "id": "orca-ai-team",
   "publisher": "tungnguyentu",
   "name": "Orca AI Team",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Start a multi-agent team room (Opus orchestrator + workers) via orca-team in the focused worktree.",
   "author": {
     "name": "Tung Nguyen Tu",
     "url": "https://github.com/tungnguyentu"
   },
   "repository": "https://github.com/tungnguyentu/orca-ai-team",
-  "engines": { "orca": ">=1.4.0" },
+  "engines": {
+    "orca": ">=1.4.0"
+  },
   "pluginApi": 1,
   "main": "plugin/main.mjs",
   "contributes": {
@@ -41,13 +43,27 @@
         "when": "worktree"
       }
     ],
-    "events": [{ "on": "worktree.created" }]
+    "events": [
+      {
+        "on": "worktree.created"
+      }
+    ]
   },
   "capabilities": [
-    { "kind": "workspace:read" },
-    { "kind": "terminal:send" },
-    { "kind": "notifications:show" },
-    { "kind": "storage" },
-    { "kind": "events:subscribe" }
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "terminal:send"
+    },
+    {
+      "kind": "notifications:show"
+    },
+    {
+      "kind": "storage"
+    },
+    {
+      "kind": "events:subscribe"
+    }
   ]
 }
