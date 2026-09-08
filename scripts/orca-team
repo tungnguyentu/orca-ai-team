@@ -34,6 +34,10 @@ DEFAULT_ORCHESTRATOR = "claude-opus"
 # command-code is omitted from room pre-open: it rewrites argv + runs onboarding,
 # so Orca inject/prompts often stall. Spawn it on demand via worker-start --agent.
 DEFAULT_WORKERS = ["claude-sonnet", "grok", "pi"]
+# User defaults: ~/.config/orca-ai-team/config.json (override with ORCA_TEAM_CONFIG).
+CONFIG_DIRNAME = "orca-ai-team"
+CONFIG_FILENAME = "config.json"
+CONFIG_ENV = "ORCA_TEAM_CONFIG"
 # Agents listed here are still allowed as --workers, but start() does not open a pane.
 # Orchestrator must use: worker-start --worktree current --agent <id>
 DEFERRED_AGENTS = frozenset({"command-code"})
@@ -203,11 +207,68 @@ def unwrap(payload: dict[str, Any]) -> Any:
     return payload.get("result", payload)
 
 
-def launch_command(agent_id: str) -> str:
+def launch_argv(agent_id: str, model: str | None = None) -> list[str]:
+    """Return launch argv for an agent, optionally overriding the model."""
     if agent_id not in AGENT_LAUNCH:
         known = ", ".join(sorted(AGENT_LAUNCH))
         raise TeamError(f"unknown agent id '{agent_id}'. Known: {known}")
-    return " ".join(AGENT_LAUNCH[agent_id])
+    argv = list(AGENT_LAUNCH[agent_id])
+    model_s = (model or "").strip() or None
+    if not model_s:
+        return argv
+
+    # Claude family already has `--model <alias>` in AGENT_LAUNCH — replace it.
+    if is_claude_agent(agent_id):
+        out: list[str] = []
+        i = 0
+        replaced = False
+        while i < len(argv):
+            if argv[i] == "--model" and i + 1 < len(argv):
+                out.extend(["--model", model_s])
+                i += 2
+                replaced = True
+                continue
+            out.append(argv[i])
+            i += 1
+        if not replaced:
+            out.extend(["--model", model_s])
+        return out
+
+    if agent_id == "grok":
+        # Prefer long form; drop prior -m/--model pairs if present.
+        out = []
+        i = 0
+        while i < len(argv):
+            if argv[i] in {"-m", "--model"} and i + 1 < len(argv):
+                i += 2
+                continue
+            out.append(argv[i])
+            i += 1
+        out.extend(["--model", model_s])
+        return out
+
+    if agent_id == "pi":
+        out = []
+        i = 0
+        while i < len(argv):
+            if argv[i] == "--model" and i + 1 < len(argv):
+                i += 2
+                continue
+            out.append(argv[i])
+            i += 1
+        out.extend(["--model", model_s])
+        return out
+
+    # command-code / codex / opencode: no reliable portable model flag here.
+    eprint(
+        f"warning: model override '{model_s}' ignored for agent '{agent_id}' "
+        "(no known launch flag)"
+    )
+    return argv
+
+
+def launch_command(agent_id: str, model: str | None = None) -> str:
+    return " ".join(launch_argv(agent_id, model=model))
 
 
 def binary_for(agent_id: str) -> str:
@@ -225,6 +286,166 @@ def parse_agent_list(raw: str | None, default: list[str]) -> list[str]:
             known = ", ".join(sorted(AGENT_LAUNCH))
             raise TeamError(f"unknown agent id '{agent}'. Known: {known}")
     return agents
+
+
+def parse_worker_models(raw: str | None) -> dict[str, str]:
+    """Parse `agent=model,agent2=model2` into a dict."""
+    out: dict[str, str] = {}
+    if not raw or not str(raw).strip():
+        return out
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise TeamError(
+                f"invalid --worker-models entry '{part}' (expected agent=model)"
+            )
+        agent, model = part.split("=", 1)
+        agent = agent.strip()
+        model = model.strip()
+        if not agent or not model:
+            raise TeamError(
+                f"invalid --worker-models entry '{part}' (expected agent=model)"
+            )
+        if agent not in AGENT_LAUNCH:
+            known = ", ".join(sorted(AGENT_LAUNCH))
+            raise TeamError(f"unknown agent id '{agent}' in --worker-models. Known: {known}")
+        out[agent] = model
+    return out
+
+
+def default_config_dict() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "orchestrator": DEFAULT_ORCHESTRATOR,
+        "workers": list(DEFAULT_WORKERS),
+        "models": {},
+    }
+
+
+def config_path() -> Path:
+    override = (os.environ.get(CONFIG_ENV) or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".config"
+    return (base / CONFIG_DIRNAME / CONFIG_FILENAME).resolve()
+
+
+def load_user_config() -> dict[str, Any] | None:
+    """Load user config or return None if missing. Raises TeamError if corrupt/invalid."""
+    path = config_path()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TeamError(f"could not read config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise TeamError(f"config {path} must be a JSON object")
+    return normalize_user_config(data, path=path)
+
+
+def normalize_user_config(
+    data: dict[str, Any], *, path: Path | None = None
+) -> dict[str, Any]:
+    loc = f" in {path}" if path else ""
+    out = default_config_dict()
+    orch = data.get("orchestrator", out["orchestrator"])
+    if not isinstance(orch, str) or orch not in AGENT_LAUNCH:
+        raise TeamError(
+            f"config{loc}: unknown orchestrator '{orch}'. "
+            f"Known: {', '.join(sorted(AGENT_LAUNCH))}"
+        )
+    out["orchestrator"] = orch
+    workers_raw = data.get("workers", out["workers"])
+    if not isinstance(workers_raw, list) or not all(isinstance(w, str) for w in workers_raw):
+        raise TeamError(f"config{loc}: workers must be a JSON array of strings")
+    workers: list[str] = []
+    for w in workers_raw:
+        if w not in AGENT_LAUNCH:
+            raise TeamError(
+                f"config{loc}: unknown worker '{w}'. "
+                f"Known: {', '.join(sorted(AGENT_LAUNCH))}"
+            )
+        if w not in workers:
+            workers.append(w)
+    out["workers"] = workers
+    models_raw = data.get("models") or {}
+    if not isinstance(models_raw, dict):
+        raise TeamError(f"config{loc}: models must be a JSON object")
+    models: dict[str, str] = {}
+    for k, v in models_raw.items():
+        if not isinstance(k, str):
+            raise TeamError(f"config{loc}: models keys must be strings")
+        if k not in AGENT_LAUNCH:
+            raise TeamError(
+                f"config{loc}: unknown agent '{k}' in models. "
+                f"Known: {', '.join(sorted(AGENT_LAUNCH))}"
+            )
+        if v is None:
+            continue
+        if not isinstance(v, str) or not v.strip():
+            raise TeamError(f"config{loc}: models['{k}'] must be a string or null")
+        models[k] = v.strip()
+    out["models"] = models
+    out["version"] = 1
+    return out
+
+
+def save_user_config(data: dict[str, Any]) -> Path:
+    path = config_path()
+    normalized = normalize_user_config(data, path=path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(normalized, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def resolve_start_roster(
+    args: argparse.Namespace,
+) -> tuple[str, list[str], dict[str, str | None], bool]:
+    """
+    Resolve orchestrator, workers, per-agent models, and whether config file exists.
+
+    Returns (orchestrator, workers, models_by_agent, config_present).
+    models_by_agent values may be None (use built-in launch model).
+    """
+    cfg = load_user_config()
+    config_present = cfg is not None
+    base = cfg or default_config_dict()
+
+    # argparse: None means "not passed" so config can apply.
+    orch_flag = getattr(args, "orchestrator", None)
+    workers_flag = getattr(args, "workers", None)
+    orchestrator = (
+        str(orch_flag)
+        if orch_flag
+        else str(base.get("orchestrator") or DEFAULT_ORCHESTRATOR)
+    )
+    if orchestrator not in AGENT_LAUNCH:
+        raise TeamError(f"unknown orchestrator '{orchestrator}'")
+
+    if workers_flag is None or str(workers_flag).strip() == "":
+        workers = list(base.get("workers") or DEFAULT_WORKERS)
+    else:
+        workers = parse_agent_list(str(workers_flag), list(DEFAULT_WORKERS))
+
+    models: dict[str, str | None] = {
+        aid: None for aid in {orchestrator, *workers}
+    }
+    for aid, model in (base.get("models") or {}).items():
+        if aid in models and isinstance(model, str) and model.strip():
+            models[aid] = model.strip()
+
+    orch_model = (getattr(args, "orchestrator_model", None) or "").strip()
+    if orch_model:
+        models[orchestrator] = orch_model
+
+    for aid, model in parse_worker_models(getattr(args, "worker_models", None)).items():
+        models[aid] = model
+
+    return orchestrator, workers, models, config_present
 
 
 def find_worktree(orca: str, cwd: Path) -> dict[str, Any]:
@@ -1725,8 +1946,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(f"  stopped previous watch pid {old_watch_pid}")
             save_state(worktree_path, existing)
 
-    orchestrator = args.orchestrator
-    workers = parse_agent_list(args.workers, DEFAULT_WORKERS)
+    orchestrator, workers, models_by_agent, config_present = resolve_start_roster(args)
     if orchestrator in workers:
         workers = [w for w in workers if w != orchestrator]
     objective = args.objective or "Coordinate the AI team on the current worktree objective"
@@ -1735,6 +1955,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     min_remaining = float(
         getattr(args, "min_remaining", DEFAULT_MIN_REMAINING_PERCENT)
     )
+    save_defaults = bool(getattr(args, "save_defaults", False))
 
     # Ensure binaries exist for requested agents.
     for agent_id in [orchestrator, *workers]:
@@ -1749,9 +1970,21 @@ def cmd_start(args: argparse.Namespace) -> int:
     split_direction = args.split_direction
     tab_title, workers_tab_title = tab_titles_for_layout(layout, orchestrator)
 
+    orch_model = models_by_agent.get(orchestrator)
+    orch_launch = launch_command(orchestrator, model=orch_model)
     print(f"Starting AI team in {worktree_path}")
-    print(f"  orchestrator: {orchestrator} → `{launch_command(orchestrator)}`")
+    print(f"  config: {config_path()}" + (" (loaded)" if config_present else " (missing — built-in defaults)"))
+    if not config_present:
+        print(
+            "  tip: set lasting defaults with: "
+            "orca-team config init && orca-team config set --orchestrator … --workers …"
+        )
+    print(f"  orchestrator: {orchestrator} → `{orch_launch}`")
     print(f"  workers: {', '.join(workers) if workers else '(none)'}")
+    for wid in workers:
+        wm = models_by_agent.get(wid)
+        if wm:
+            print(f"    model {wid}: {wm}")
     layout_note = ""
     if layout in {"split", "dual"}:
         layout_note = f" ({split_direction})"
@@ -1795,7 +2028,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     orch_term = create_terminal(
         orca,
         title=tab_title,
-        command=launch_command(orchestrator),
+        command=orch_launch,
         worktree_selector=selector,
         focus=False,
     )
@@ -1810,7 +2043,8 @@ def cmd_start(args: argparse.Namespace) -> int:
             "agentId": orchestrator,
             "title": f"orchestrator:{orchestrator}",
             "handle": orch_handle,
-            "launchCommand": launch_command(orchestrator),
+            "launchCommand": orch_launch,
+            "model": orch_model,
             "tabId": orch_tab_id,
             "paneKey": orch_term.get("paneKey"),
         }
@@ -1842,6 +2076,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     workers_tab_handle: str | None = None
     opened_index = 0
     for agent_id in workers:
+        agent_model = models_by_agent.get(agent_id)
+        agent_launch = launch_command(agent_id, model=agent_model)
         if agent_id in DEFERRED_AGENTS or agent_id in quota_deferred:
             reason = (
                 "low quota"
@@ -1862,7 +2098,8 @@ def cmd_start(args: argparse.Namespace) -> int:
                     "deferred": True,
                     "deferredReason": "quota_low" if agent_id in quota_deferred else "agent_policy",
                     "usage": usage_by_id.get(agent_id),
-                    "launchCommand": launch_command(agent_id),
+                    "launchCommand": agent_launch,
+                    "model": agent_model,
                     "tabId": workers_tab_id if layout == "dual" else orch_tab_id,
                     "paneKey": None,
                     "spawnHint": (
@@ -1885,7 +2122,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             term = split_terminal(
                 orca,
                 from_handle=split_anchor,
-                command=launch_command(agent_id),
+                command=agent_launch,
                 direction=direction,
             )
             handle = term["handle"]
@@ -1900,7 +2137,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 term = create_terminal(
                     orca,
                     title=workers_tab_title,
-                    command=launch_command(agent_id),
+                    command=agent_launch,
                     worktree_selector=selector,
                 )
                 handle = term["handle"]
@@ -1916,7 +2153,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 term = split_terminal(
                     orca,
                     from_handle=split_anchor,
-                    command=launch_command(agent_id),
+                    command=agent_launch,
                     direction=direction,
                 )
                 handle = term["handle"]
@@ -1929,7 +2166,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             term = create_terminal(
                 orca,
                 title=f"worker:{agent_id}",
-                command=launch_command(agent_id),
+                command=agent_launch,
                 worktree_selector=selector,
             )
             handle = term["handle"]
@@ -1945,7 +2182,8 @@ def cmd_start(args: argparse.Namespace) -> int:
                 "title": f"worker:{agent_id}",
                 "handle": handle,
                 "deferred": False,
-                "launchCommand": launch_command(agent_id),
+                "launchCommand": agent_launch,
+                "model": agent_model,
                 "tabId": term.get("tabId")
                 or (workers_tab_id if layout == "dual" else orch_tab_id),
                 "paneKey": term.get("paneKey"),
@@ -2149,6 +2387,13 @@ def cmd_start(args: argparse.Namespace) -> int:
         "minRemainingPercent": None if ignore_quota else min_remaining,
         "usageAtStart": usage_rows,
         "quotaDeferred": sorted(quota_deferred),
+        "models": {
+            aid: model
+            for aid, model in models_by_agent.items()
+            if isinstance(model, str) and model.strip()
+        },
+        "userConfigPath": str(config_path()),
+        "userConfigLoaded": config_present,
     }
     path = save_state(worktree_path, state)
 
@@ -2239,6 +2484,23 @@ def cmd_start(args: argparse.Namespace) -> int:
     print("  open:     orca-team open   # host focus + remote instructions")
     print("  status:   orca-team status")
     print("  stop:     orca-team stop")
+
+    if save_defaults:
+        models_to_save = {
+            aid: model
+            for aid, model in models_by_agent.items()
+            if isinstance(model, str) and model.strip()
+        }
+        saved = save_user_config(
+            {
+                "version": 1,
+                "orchestrator": orchestrator,
+                "workers": workers,
+                "models": models_to_save,
+            }
+        )
+        print(f"  saved defaults → {saved}")
+
     print("\nStart finished — shell is free. Watch keeps running in the background.")
     sys.stdout.flush()
     return 0
@@ -2829,6 +3091,74 @@ def cmd_assign(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config(args: argparse.Namespace) -> int:
+    """Show / init / set / edit user defaults for start roster and models."""
+    action = getattr(args, "config_action", None) or "show"
+    path = config_path()
+
+    if action == "path":
+        print(path)
+        return 0
+
+    if action == "show":
+        cfg = load_user_config()
+        effective = cfg or default_config_dict()
+        print(f"config path: {path}")
+        print(f"exists: {'yes' if cfg is not None else 'no (using built-in defaults)'}")
+        print(json.dumps(effective, indent=2))
+        return 0
+
+    if action == "init":
+        if path.is_file() and not args.force:
+            raise TeamError(
+                f"config already exists at {path} (pass --force to overwrite)"
+            )
+        saved = save_user_config(default_config_dict())
+        print(f"wrote {saved}")
+        print(json.dumps(load_user_config() or {}, indent=2))
+        return 0
+
+    if action == "set":
+        cfg = load_user_config() or default_config_dict()
+        if getattr(args, "orchestrator", None):
+            cfg["orchestrator"] = args.orchestrator
+        if getattr(args, "workers", None) is not None and str(args.workers).strip() != "":
+            cfg["workers"] = parse_agent_list(str(args.workers), list(DEFAULT_WORKERS))
+        models = dict(cfg.get("models") or {})
+        if getattr(args, "clear_models", False):
+            models = {}
+        for aid, model in parse_worker_models(getattr(args, "model", None)).items():
+            models[aid] = model
+        orch_model = (getattr(args, "orchestrator_model", None) or "").strip()
+        if orch_model:
+            models[str(cfg["orchestrator"])] = orch_model
+        cfg["models"] = models
+        saved = save_user_config(cfg)
+        print(f"updated {saved}")
+        print(json.dumps(load_user_config() or {}, indent=2))
+        return 0
+
+    if action == "edit":
+        if not path.is_file():
+            save_user_config(default_config_dict())
+            print(f"created {path}")
+        editor = (os.environ.get("EDITOR") or os.environ.get("VISUAL") or "").strip()
+        if not editor:
+            print(f"No $EDITOR set. Edit manually:\n  {path}")
+            return 0
+        # EDITOR may be "code --wait" etc.
+        cmd = [*editor.split(), str(path)]
+        proc = subprocess.run(cmd, check=False)
+        if proc.returncode != 0:
+            raise TeamError(f"editor exited {proc.returncode}: {' '.join(cmd)}")
+        # Re-validate after edit.
+        load_user_config()
+        print(f"ok — config valid at {path}")
+        return 0
+
+    raise TeamError(f"unknown config action '{action}'")
+
+
 def cmd_set_orchestrator(args: argparse.Namespace) -> int:
     """Replace the orchestrator (rate-limit / model swap) while keeping the same Run."""
     orca = resolve_orca()
@@ -2858,9 +3188,15 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
     layout = state.get("layout") or "tabs"
     split_direction = state.get("splitDirection") or "horizontal"
     reason = args.reason or "orchestrator swap (limit / model change)"
+    cfg = load_user_config() or default_config_dict()
+    new_model = (getattr(args, "model", None) or "").strip() or (
+        (cfg.get("models") or {}).get(new_agent)
+    )
+    new_launch = launch_command(new_agent, model=new_model)
 
     print(f"Changing orchestrator → {new_agent} ({reason})")
     print(f"  previous: {old_orch.get('agentId')} handle={old_orch.get('handle')}")
+    print(f"  launch: `{new_launch}`")
 
     if is_claude_agent(new_agent):
         ensure_claude_project_trust(worktree_path)
@@ -2885,6 +3221,8 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
             "role": "orchestrator",
             "title": f"orchestrator:{new_agent}",
             "agentId": new_agent,
+            "launchCommand": new_launch,
+            "model": new_model,
         }
     else:
         # Spawn a fresh orchestrator pane/tab.
@@ -2893,7 +3231,7 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
             term = split_terminal(
                 orca,
                 from_handle=str(old_orch["handle"]),
-                command=launch_command(new_agent),
+                command=new_launch,
                 direction=str(split_direction),
             )
             print(f"  split new orchestrator pane {term['handle']}")
@@ -2902,7 +3240,7 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
             term = create_terminal(
                 orca,
                 title=orch_title,
-                command=launch_command(new_agent),
+                command=new_launch,
                 worktree_selector=selector,
             )
             print(f"  created new orchestrator terminal {term['handle']} (tab '{orch_title}')")
@@ -2913,7 +3251,8 @@ def cmd_set_orchestrator(args: argparse.Namespace) -> int:
             "agentId": new_agent,
             "title": f"orchestrator:{new_agent}",
             "handle": new_handle,
-            "launchCommand": launch_command(new_agent),
+            "launchCommand": new_launch,
+            "model": new_model,
             "tabId": term.get("tabId") or old_orch.get("tabId"),
             "paneKey": term.get("paneKey"),
         }
@@ -3667,14 +4006,35 @@ def build_parser() -> argparse.ArgumentParser:
     start = sub.add_parser("start", help="Start orchestrator + workers in the current worktree")
     start.add_argument(
         "--orchestrator",
-        default=DEFAULT_ORCHESTRATOR,
+        default=None,
         choices=sorted(AGENT_LAUNCH),
-        help=f"Orchestrator agent id (default: {DEFAULT_ORCHESTRATOR} = Claude Opus)",
+        help=(
+            "Orchestrator agent id (default: user config, else "
+            f"{DEFAULT_ORCHESTRATOR})"
+        ),
     )
     start.add_argument(
         "--workers",
-        default=",".join(DEFAULT_WORKERS),
-        help=f"Comma-separated worker agent ids (default: {','.join(DEFAULT_WORKERS)})",
+        default=None,
+        help=(
+            "Comma-separated worker agent ids (default: user config, else "
+            f"{','.join(DEFAULT_WORKERS)})"
+        ),
+    )
+    start.add_argument(
+        "--orchestrator-model",
+        default="",
+        help="Provider/CLI model id for the orchestrator this run (overrides config)",
+    )
+    start.add_argument(
+        "--worker-models",
+        default="",
+        help="Per-worker models as agent=model pairs, e.g. pi=openai/gpt-4o,grok=grok-4",
+    )
+    start.add_argument(
+        "--save-defaults",
+        action="store_true",
+        help="After a successful start, write effective orch/workers/models to user config",
     )
     start.add_argument("--objective", default="", help="Team objective / run objective")
     start.add_argument("--mode", choices=["room", "supervise"], default="room")
@@ -3754,6 +4114,58 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="Show team state for the current worktree")
     status.set_defaults(func=cmd_status)
+
+    config_cmd = sub.add_parser(
+        "config",
+        help="Show/edit lasting start defaults (~/.config/orca-ai-team/config.json)",
+    )
+    config_sub = config_cmd.add_subparsers(dest="config_action", required=True)
+
+    config_show = config_sub.add_parser("show", help="Print config path + effective JSON")
+    config_show.set_defaults(func=cmd_config, config_action="show")
+
+    config_path_p = config_sub.add_parser("path", help="Print config file path only")
+    config_path_p.set_defaults(func=cmd_config, config_action="path")
+
+    config_init = config_sub.add_parser(
+        "init", help="Write built-in defaults to the config file"
+    )
+    config_init.add_argument(
+        "--force", action="store_true", help="Overwrite an existing config file"
+    )
+    config_init.set_defaults(func=cmd_config, config_action="init")
+
+    config_set = config_sub.add_parser("set", help="Update orchestrator / workers / models")
+    config_set.add_argument(
+        "--orchestrator",
+        default=None,
+        choices=sorted(AGENT_LAUNCH),
+        help="Default orchestrator agent id",
+    )
+    config_set.add_argument(
+        "--workers",
+        default=None,
+        help="Comma-separated default worker agent ids",
+    )
+    config_set.add_argument(
+        "--orchestrator-model",
+        default="",
+        help="Default model id for the orchestrator agent",
+    )
+    config_set.add_argument(
+        "--model",
+        default="",
+        help="Set model(s) as agent=model pairs (repeatable via comma list)",
+    )
+    config_set.add_argument(
+        "--clear-models",
+        action="store_true",
+        help="Clear all stored model overrides before applying --model",
+    )
+    config_set.set_defaults(func=cmd_config, config_action="set")
+
+    config_edit = config_sub.add_parser("edit", help="Open config in $EDITOR")
+    config_edit.set_defaults(func=cmd_config, config_action="edit")
 
     assign = sub.add_parser(
         "assign",
@@ -3848,6 +4260,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh",
         action="store_true",
         help="Always spawn a new pane/tab instead of promoting an existing worker",
+    )
+    set_orch.add_argument(
+        "--model",
+        default="",
+        help="Model id for the new orchestrator launch (else user config models)",
     )
     set_orch.add_argument(
         "--close-old",

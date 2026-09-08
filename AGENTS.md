@@ -64,7 +64,13 @@ From inside an Orca worktree:
 
 ```bash
 orca-team doctor
-orca-team start --objective "<goal>"   # dual layout by default
+orca-team config show          # ~/.config/orca-ai-team/config.json (or $ORCA_TEAM_CONFIG)
+orca-team config init
+orca-team config set --orchestrator claude-opus --workers claude-sonnet,grok,pi
+orca-team config set --model pi=openai/gpt-4o --orchestrator-model opus
+orca-team start --objective "<goal>"   # dual layout; uses config defaults
+# overrides: --orchestrator / --workers / --orchestrator-model / --worker-models
+# persist this run: --save-defaults
 orca-team status
 orca-team usage                # remaining % for grok/claude; LOW ⇒ do not assign
 orca-team assign --worker pi --spec "…" --done "…"   # lean: role once + short card
