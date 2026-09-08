@@ -24,6 +24,8 @@ HANDOFF_FILENAME = "AI-TEAM-HANDOFF.md"
 HANDOFF_MAX_CHARS = 12_000
 DEFAULT_WATCH_INTERVAL = 60
 DEFAULT_WATCH_STALE_MINUTES = 15.0
+# Skip opening/assigning workers below this remaining usage % (best-effort probes).
+DEFAULT_MIN_REMAINING_PERCENT = 10.0
 # Layout: dual = orchestrator alone in one tab, all workers split in a second tab.
 DEFAULT_LAYOUT = "dual"
 ORCH_TAB_TITLE = "ai-team:orch"
@@ -270,6 +272,200 @@ def delete_watch_log(worktree_path: Path) -> bool:
 
 def handoff_path_for(worktree_path: Path) -> Path:
     return worktree_path / HANDOFF_FILENAME
+
+
+def _http_get_json(url: str, *, headers: dict[str, str], timeout: float = 15.0) -> dict[str, Any] | None:
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+
+
+def probe_grok_usage() -> dict[str, Any]:
+    """Query Grok Build weekly credit usage via cli-chat-proxy (same as /usage)."""
+    auth_path = Path.home() / ".grok" / "auth.json"
+    out: dict[str, Any] = {
+        "agentId": "grok",
+        "ok": False,
+        "remainingPercent": None,
+        "usedPercent": None,
+        "source": "grok-billing",
+        "detail": "",
+    }
+    if not auth_path.is_file():
+        out["detail"] = "missing ~/.grok/auth.json"
+        return out
+    try:
+        auth = json.loads(auth_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        out["detail"] = f"auth read error: {exc}"
+        return out
+    entry = next(
+        (v for v in auth.values() if isinstance(v, dict) and v.get("key")),
+        None,
+    )
+    if not entry:
+        out["detail"] = "no grok access token in auth.json"
+        return out
+    token = str(entry.get("key") or "")
+    data = _http_get_json(
+        "https://cli-chat-proxy.grok.com/v1/billing?format=credits",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "orca-team-usage",
+        },
+    )
+    if not data:
+        out["detail"] = "billing request failed (token expired? re-login with `grok`)"
+        return out
+    cfg = data.get("config") if isinstance(data.get("config"), dict) else data
+    used = cfg.get("creditUsagePercent")
+    if used is None:
+        products = cfg.get("productUsage") or []
+        if isinstance(products, list) and products:
+            used = (products[0] or {}).get("usagePercent")
+    try:
+        used_f = float(used)
+    except (TypeError, ValueError):
+        out["detail"] = f"unexpected billing payload keys={list(cfg.keys())[:8]}"
+        return out
+    remaining = max(0.0, 100.0 - used_f)
+    period = cfg.get("currentPeriod") if isinstance(cfg.get("currentPeriod"), dict) else {}
+    out.update(
+        {
+            "ok": True,
+            "usedPercent": used_f,
+            "remainingPercent": remaining,
+            "detail": (
+                f"GrokBuild weekly {used_f:.0f}% used / {remaining:.0f}% left"
+                + (f" (resets {period.get('end')})" if period.get("end") else "")
+            ),
+            "periodEnd": period.get("end"),
+        }
+    )
+    return out
+
+
+def probe_claude_usage() -> dict[str, Any]:
+    """Parse `claude /usage` text for session/week remaining %."""
+    out: dict[str, Any] = {
+        "agentId": "claude",
+        "ok": False,
+        "remainingPercent": None,
+        "usedPercent": None,
+        "source": "claude-/usage",
+        "detail": "",
+    }
+    if not shutil.which("claude"):
+        out["detail"] = "claude not on PATH"
+        return out
+    try:
+        proc = subprocess.run(
+            ["claude", "/usage"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=45,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        out["detail"] = f"claude /usage failed: {exc}"
+        return out
+    text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    # e.g. "Current session: 30% used" / "Current week (all models): 46% used"
+    used_vals: list[float] = []
+    details: list[str] = []
+    for label, pat in (
+        ("session", re.compile(r"(?i)current session:\s*(\d+(?:\.\d+)?)\s*%\s*used")),
+        ("week", re.compile(r"(?i)current week[^\n:]*:\s*(\d+(?:\.\d+)?)\s*%\s*used")),
+    ):
+        m = pat.search(text)
+        if m:
+            used_vals.append(float(m.group(1)))
+            details.append(f"{label} {m.group(1)}% used")
+    if not used_vals:
+        out["detail"] = "could not parse claude /usage"
+        return out
+    used_f = max(used_vals)  # most restrictive bucket
+    remaining = max(0.0, 100.0 - used_f)
+    out.update(
+        {
+            "ok": True,
+            "usedPercent": used_f,
+            "remainingPercent": remaining,
+            "detail": f"Claude {', '.join(details)} → {remaining:.0f}% remaining (strictest)",
+        }
+    )
+    return out
+
+
+def probe_agent_usage(agent_id: str) -> dict[str, Any]:
+    """Best-effort remaining usage for a roster agent id."""
+    aid = agent_id
+    if is_claude_agent(aid) or aid in {"claude", "opus", "sonnet"}:
+        row = probe_claude_usage()
+        row["agentId"] = aid
+        return row
+    if aid in {"grok"}:
+        return probe_grok_usage()
+    # pi / command-code / codex: no reliable subscription probe yet
+    return {
+        "agentId": aid,
+        "ok": True,
+        "remainingPercent": None,
+        "usedPercent": None,
+        "source": "none",
+        "detail": "no quota probe for this agent (treat as available)",
+        "unknown": True,
+    }
+
+
+def usage_report(agent_ids: list[str]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for aid in agent_ids:
+        # Deduplicate Claude probes (opus+sonnet share one pool).
+        key = "claude" if is_claude_agent(aid) or aid in {"claude", "opus", "sonnet"} else aid
+        if key in seen:
+            # Reuse prior Claude row with this agent id label.
+            base = next((r for r in rows if r.get("_pool") == key), None)
+            if base:
+                copy = dict(base)
+                copy["agentId"] = aid
+                rows.append(copy)
+            continue
+        seen.add(key)
+        row = probe_agent_usage(aid)
+        row["_pool"] = key
+        rows.append(row)
+    for row in rows:
+        row.pop("_pool", None)
+    return rows
+
+
+def agent_below_quota(
+    row: dict[str, Any], *, min_remaining: float
+) -> bool:
+    """True when we know remaining % and it is below the threshold."""
+    if row.get("unknown"):
+        return False
+    if not row.get("ok"):
+        # Failed probe: do not auto-block (could be transient), but flag.
+        return False
+    rem = row.get("remainingPercent")
+    if rem is None:
+        return False
+    try:
+        return float(rem) < float(min_remaining)
+    except (TypeError, ValueError):
+        return False
 
 
 def load_handoff_text(worktree_path: Path, *, max_chars: int = HANDOFF_MAX_CHARS) -> str | None:
@@ -574,6 +770,139 @@ def save_state(worktree_path: Path, state: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2) + "\n")
     return path
+
+
+LEAN_ASSIGN_MARKER = "[orca-team lean-assign]"
+WORKER_ROLE_REMINDER = (
+    f"{LEAN_ASSIGN_MARKER} mode=role-reminder\n"
+    "Standing worker role already loaded on this pane — do not wait for a full re-inject.\n"
+    "Follow prior worker rules: stay in scope; finish with worker_done or ask; never go silent.\n"
+)
+
+
+def list_live_handles(orca: str, worktree_path: Path) -> set[str]:
+    """Return live terminal handles for a worktree (best-effort)."""
+    live = orca_json(
+        orca,
+        ["terminal", "list", "--worktree", f"path:{worktree_path}"],
+        check=False,
+    )
+    handles: set[str] = set()
+    if not live.get("ok"):
+        return handles
+    result = unwrap(live)
+    terms = result.get("terminals") or result.get("items") or result
+    if isinstance(terms, list):
+        for term in terms:
+            if isinstance(term, dict) and term.get("handle"):
+                handles.add(str(term["handle"]))
+    return handles
+
+
+def mark_role_injected(member: dict[str, Any], handle: str) -> None:
+    member["roleInjectedHandle"] = handle
+    member["roleInjectedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def clear_role_injected(member: dict[str, Any]) -> None:
+    member.pop("roleInjectedHandle", None)
+    member.pop("roleInjectedAt", None)
+
+
+def member_needs_role_inject(
+    member: dict[str, Any],
+    *,
+    live_handles: set[str] | None = None,
+    force: bool = False,
+) -> bool:
+    """True when this worker pane should get a full role inject (fresh pane)."""
+    if force:
+        return True
+    if member.get("role") == "orchestrator":
+        return True  # orch path still uses full template; caller decides
+    handle = member.get("handle")
+    if not handle or member.get("deferred"):
+        return True
+    handle_s = str(handle)
+    if live_handles is not None and handle_s not in live_handles:
+        clear_role_injected(member)
+        return True
+    injected = member.get("roleInjectedHandle")
+    if not injected:
+        return True
+    if str(injected) != handle_s:
+        return True
+    return False
+
+
+def build_lean_task_card(
+    *,
+    goal: str,
+    in_scope: str = "",
+    out_scope: str = "",
+    done_criteria: str = "",
+    run_id: str,
+    task_id: str,
+    dispatch_id: str,
+    mode: str = "lean",
+) -> str:
+    """Short per-task card (R4). Raises TeamError if required fields missing."""
+    goal_s = (goal or "").strip()
+    done_s = (done_criteria or "").strip() or (
+        "Complete the goal; list files touched; report via worker_done."
+    )
+    if not goal_s:
+        raise TeamError("lean task card requires a goal/spec")
+    if not run_id or not task_id:
+        raise TeamError("lean task card requires run_id and task_id")
+    paths_block = ""
+    if in_scope.strip() or out_scope.strip():
+        paths_block = (
+            f"In-scope paths: {in_scope.strip() or '(see goal)'}\n"
+            f"Out-of-scope: {out_scope.strip() or '(do not expand)'}\n"
+        )
+    dispatch_s = (dispatch_id or "").strip() or "(pending)"
+    worker_done = (
+        "orca orchestration send --type worker_done "
+        f'--subject "done" --body "<what you did>" '
+        f"--task-id {task_id} --dispatch-id {dispatch_s} "
+        "--outcome succeeded --json"
+    )
+    ask_line = (
+        'orca orchestration ask --question "<blocker>" --timeout-ms 600000 --json'
+    )
+    return (
+        f"{LEAN_ASSIGN_MARKER} mode={mode}\n"
+        f"GOAL: {goal_s}\n"
+        f"{paths_block}"
+        f"Done criteria: {done_s}\n"
+        f"runId: {run_id}\n"
+        f"taskId: {task_id}\n"
+        f"dispatchId: {dispatch_s}\n"
+        "When finished, send exactly one worker_done (or ask if blocked):\n"
+        f"  {worker_done}\n"
+        f"Blocked:\n  {ask_line}\n"
+    )
+
+
+def resolve_worker_member(
+    state: dict[str, Any], worker_ref: str
+) -> dict[str, Any]:
+    """Resolve --worker agentId or handle to a worker member dict."""
+    ref = (worker_ref or "").strip()
+    if not ref:
+        raise TeamError("worker ref required")
+    members = list(state.get("members") or [])
+    workers = [m for m in members if m.get("role") == "worker"]
+    for m in workers:
+        if str(m.get("agentId") or "") == ref or str(m.get("handle") or "") == ref:
+            return m
+        if str(m.get("title") or "") == ref:
+            return m
+    known = ", ".join(
+        f"{m.get('agentId')}({m.get('handle') or 'no-handle'})" for m in workers
+    ) or "(none)"
+    raise TeamError(f"unknown worker '{ref}'. Roster: {known}")
 
 
 def pid_alive(pid: int) -> bool:
@@ -1402,6 +1731,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         workers = [w for w in workers if w != orchestrator]
     objective = args.objective or "Coordinate the AI team on the current worktree objective"
     enable_watch = bool(getattr(args, "watch", True))
+    ignore_quota = bool(getattr(args, "ignore_quota", False))
+    min_remaining = float(
+        getattr(args, "min_remaining", DEFAULT_MIN_REMAINING_PERCENT)
+    )
 
     # Ensure binaries exist for requested agents.
     for agent_id in [orchestrator, *workers]:
@@ -1426,7 +1759,32 @@ def cmd_start(args: argparse.Namespace) -> int:
         layout_note += f" — tabs '{tab_title}' + '{workers_tab_title}'"
     print(f"  layout: {layout}{layout_note}")
     print(f"  watch: {'on' if enable_watch else 'off'}")
+    print(
+        f"  quota: {'ignored' if ignore_quota else f'skip workers <{min_remaining:.0f}% remaining'}"
+    )
     print(f"  objective: {objective}")
+
+    # Probe usage before opening panes — skip exhausted workers (e.g. grok at 4%).
+    quota_deferred: set[str] = set()
+    usage_rows = usage_report([orchestrator, *workers])
+    usage_by_id = {str(r.get("agentId")): r for r in usage_rows}
+    print("  usage:")
+    for row in usage_rows:
+        aid = str(row.get("agentId"))
+        flag = ""
+        if not ignore_quota and aid != orchestrator and agent_below_quota(
+            row, min_remaining=min_remaining
+        ):
+            quota_deferred.add(aid)
+            flag = " → DEFER (low quota)"
+        status = "ok" if row.get("ok") else "fail"
+        rem = row.get("remainingPercent")
+        rem_s = f"{float(rem):.0f}% left" if rem is not None else "unknown"
+        print(f"    - {aid}: {status} {rem_s} — {row.get('detail') or ''}{flag}")
+    if quota_deferred:
+        print(
+            f"  deferring low-quota workers (no pane): {', '.join(sorted(quota_deferred))}"
+        )
 
     if is_claude_agent(orchestrator) or any(is_claude_agent(w) for w in workers):
         ensure_claude_project_trust(worktree_path)
@@ -1484,11 +1842,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     workers_tab_handle: str | None = None
     opened_index = 0
     for agent_id in workers:
-        if agent_id in DEFERRED_AGENTS:
+        if agent_id in DEFERRED_AGENTS or agent_id in quota_deferred:
+            reason = (
+                "low quota"
+                if agent_id in quota_deferred
+                else "deferred agent (open via worker-start)"
+            )
+            rem = (usage_by_id.get(agent_id) or {}).get("remainingPercent")
+            rem_note = f", ~{float(rem):.0f}% remaining" if rem is not None else ""
             print(
-                f"  deferred worker:{agent_id} (no pane) — "
-                "orchestrator must use worker-start --agent "
-                f"{agent_id}"
+                f"  deferred worker:{agent_id} (no pane) — {reason}{rem_note}"
             )
             members.append(
                 {
@@ -1497,12 +1860,21 @@ def cmd_start(args: argparse.Namespace) -> int:
                     "title": f"worker:{agent_id}",
                     "handle": None,
                     "deferred": True,
+                    "deferredReason": "quota_low" if agent_id in quota_deferred else "agent_policy",
+                    "usage": usage_by_id.get(agent_id),
                     "launchCommand": launch_command(agent_id),
                     "tabId": workers_tab_id if layout == "dual" else orch_tab_id,
                     "paneKey": None,
                     "spawnHint": (
                         f"orca orchestration worker-start --task <task_id> "
                         f"--worktree current --agent {agent_id} --json"
+                        if agent_id not in quota_deferred
+                        else (
+                            f"SKIP until quota recovers "
+                            f"(remaining {rem}% < {min_remaining:.0f}%)"
+                            if rem is not None
+                            else "SKIP until quota recovers"
+                        )
                     ),
                 }
             )
@@ -1637,6 +2009,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         print(f"  injecting role prompt → {member['title']}")
         wait_agent_ready(orca, member["handle"], agent_id=str(member.get("agentId") or ""))
         terminal_send(orca, member["handle"], prompt)
+        if member.get("role") == "worker":
+            mark_role_injected(member, str(member["handle"]))
         # Brief pause so TUIs don't race successive injects on the same host.
         time.sleep(0.4)
 
@@ -1772,6 +2146,9 @@ def cmd_start(args: argparse.Namespace) -> int:
         "watchEnabled": enable_watch,
         "watchPid": None,
         "watchLog": None,
+        "minRemainingPercent": None if ignore_quota else min_remaining,
+        "usageAtStart": usage_rows,
+        "quotaDeferred": sorted(quota_deferred),
     }
     path = save_state(worktree_path, state)
 
@@ -1918,18 +2295,82 @@ def roster_from_members(members: list[dict[str, Any]]) -> str:
             continue
         agent_id = member.get("agentId")
         if member.get("deferred") or not member.get("handle"):
+            reason = member.get("deferredReason") or "deferred"
             hint = member.get("spawnHint") or (
                 f"orca orchestration worker-start --task <task_id> "
                 f"--worktree current --agent {agent_id} --json"
             )
-            lines.append(
-                f"- {agent_id}: DEFERRED (no live pane) — spawn with `{hint}`"
-            )
+            if reason == "quota_low":
+                lines.append(
+                    f"- {agent_id}: DEFERRED (low quota) — do NOT assign/open until usage recovers "
+                    f"(`orca-team usage`). Hint: {hint}"
+                )
+            else:
+                lines.append(
+                    f"- {agent_id}: DEFERRED (no live pane) — spawn with `{hint}`"
+                )
         else:
             lines.append(
                 f"- {agent_id}: handle `{member.get('handle')}` title `{member.get('title')}`"
             )
     return "\n".join(lines) if lines else "- (no workers)"
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    """Show remaining usage for orchestrator + workers (and optional extra agents)."""
+    cwd = Path.cwd()
+    agents: list[str] = []
+    state = None
+    try:
+        orca = resolve_orca()
+        wt = find_worktree(orca, cwd)
+        state = load_state(Path(wt["path"]).resolve())
+    except TeamError:
+        state = None
+    if state and state.get("members"):
+        for m in state.get("members") or []:
+            aid = m.get("agentId")
+            if aid:
+                agents.append(str(aid))
+    extra = str(getattr(args, "agents", "") or "").strip()
+    if extra:
+        for part in extra.split(","):
+            aid = part.strip()
+            if not aid:
+                continue
+            if aid not in AGENT_LAUNCH:
+                raise TeamError(f"unknown agent id '{aid}'")
+            agents.append(aid)
+    if not agents:
+        agents = [DEFAULT_ORCHESTRATOR, *DEFAULT_WORKERS]
+    # unique preserve order
+    seen: set[str] = set()
+    ordered = []
+    for a in agents:
+        if a not in seen:
+            seen.add(a)
+            ordered.append(a)
+    min_remaining = float(getattr(args, "min_remaining", DEFAULT_MIN_REMAINING_PERCENT))
+    rows = usage_report(ordered)
+    if getattr(args, "json", False):
+        print(json.dumps({"minRemainingPercent": min_remaining, "agents": rows}, indent=2))
+        return 0
+    print(f"Agent usage (skip assign if remaining < {min_remaining:.0f}%)")
+    rc = 0
+    for row in rows:
+        aid = row.get("agentId")
+        rem = row.get("remainingPercent")
+        if rem is None:
+            mark = "?"
+        elif agent_below_quota(row, min_remaining=min_remaining):
+            mark = "LOW"
+            rc = 1
+        else:
+            mark = "OK"
+        rem_s = f"{float(rem):.0f}% left" if rem is not None else "unknown"
+        print(f"  [{mark}] {aid}: {rem_s} — {row.get('detail') or row.get('source')}")
+    print("Tip: orchestrator should run this before dispatching / worker-start.")
+    return rc
 
 
 def cmd_open(args: argparse.Namespace) -> int:
@@ -1990,6 +2431,7 @@ def reinject_roles(
     worktree_path: Path,
     targets: list[dict[str, Any]] | None = None,
     orchestrator_prefix: str | None = None,
+    force_role: bool = False,
 ) -> None:
     members = list(state.get("members") or [])
     orch = next((m for m in members if m.get("role") == "orchestrator"), None)
@@ -2000,11 +2442,25 @@ def reinject_roles(
     templates = load_role_templates()
     roster = roster_from_members(members)
     selected = targets if targets is not None else members
+    live_handles = list_live_handles(orca, worktree_path)
 
     for member in selected:
         handle = member.get("handle")
         if not handle:
             continue
+        role = member.get("role")
+        # Workers: send-once — short reminder unless fresh pane or --force-role.
+        if role == "worker" and not member_needs_role_inject(
+            member, live_handles=live_handles, force=force_role
+        ):
+            print(
+                f"  reinject reminder → {member.get('title') or member.get('agentId')} "
+                "(lean; use --force-role for full worker bible)"
+            )
+            terminal_send(orca, handle, WORKER_ROLE_REMINDER)
+            time.sleep(0.4)
+            continue
+
         prompt = build_role_prompt(
             templates=templates,
             member=member,
@@ -2014,17 +2470,20 @@ def reinject_roles(
             orch_handle=str(orch["handle"]),
             roster=roster,
         )
-        if member.get("role") == "orchestrator" and orchestrator_prefix:
+        if role == "orchestrator" and orchestrator_prefix:
             prompt = orchestrator_prefix + "\n\n" + prompt
-        elif member.get("role") == "orchestrator":
+        elif role == "orchestrator":
             prompt = (
                 "CORRECTION: You drifted into doing implementation yourself. "
-                "Stop coding. You are orchestrator-only — delegate with task-create + "
-                "worker-start/dispatch to the worker roster, then wait on worker_done/ask.\n\n"
+                "Stop coding. You are orchestrator-only — delegate with "
+                "`orca-team assign` (lean) or task-create + worker-start for fresh panes, "
+                "then wait on worker_done/ask.\n\n"
                 + prompt
             )
         print(f"  reinjecting → {member.get('title') or member.get('agentId')}")
         terminal_send(orca, handle, prompt)
+        if role == "worker":
+            mark_role_injected(member, str(handle))
         time.sleep(0.4)
 
     orca_json(
@@ -2062,8 +2521,279 @@ def cmd_reinject(args: argparse.Namespace) -> int:
     if not orch:
         raise TeamError("team state missing orchestrator")
     targets = [orch] if args.orchestrator_only else members
-    reinject_roles(orca, state=state, worktree_path=worktree_path, targets=targets)
+    force_role = bool(getattr(args, "force_role", False))
+    reinject_roles(
+        orca,
+        state=state,
+        worktree_path=worktree_path,
+        targets=targets,
+        force_role=force_role,
+    )
+    save_state(worktree_path, state)
     print("Reinjected role prompts.")
+    return 0
+
+
+def cmd_assign(args: argparse.Namespace) -> int:
+    """Lean-assign a task to a roster worker (send-once role + short card)."""
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state or state.get("status") != "running":
+        raise TeamError("no running ai-team; start a team first")
+    run_id = str(state.get("runId") or "")
+    if not run_id:
+        raise TeamError("team state missing runId")
+    orch = next((m for m in state.get("members") or [] if m.get("role") == "orchestrator"), None)
+    if not orch or not orch.get("handle"):
+        raise TeamError("team state missing orchestrator handle")
+    orch_handle = str(orch["handle"])
+    member = resolve_worker_member(state, args.worker)
+    agent_id = str(member.get("agentId") or "worker")
+    live_handles = list_live_handles(orca, worktree_path)
+    dry_run = bool(args.dry_run)
+    force_role = bool(args.force_role)
+    as_json = bool(args.json)
+
+    # Fresh spawn when deferred / no live handle.
+    handle = member.get("handle")
+    needs_spawn = (
+        member.get("deferred")
+        or not handle
+        or (handle and str(handle) not in live_handles and live_handles)
+    )
+    planned: dict[str, Any] = {
+        "worker": agent_id,
+        "runId": run_id,
+        "needsSpawn": bool(needs_spawn),
+        "needsRole": False,
+        "mode": "lean",
+        "dryRun": dry_run,
+    }
+
+    if needs_spawn and not dry_run:
+        # Create task first so worker-start has something to bind (may fat-inject once).
+        spec = (args.spec or "").strip()
+        if not spec:
+            raise TeamError("--spec required when spawning a fresh worker pane")
+        task_payload = orca_json(
+            orca,
+            [
+                "orchestration",
+                "task-create",
+                "--spec",
+                f"[{agent_id}] {spec}",
+                "--from",
+                orch_handle,
+                "--run",
+                run_id,
+            ],
+        )
+        task = unwrap(task_payload).get("task") or unwrap(task_payload)
+        task_id = str(task.get("id") or task.get("taskId") or "")
+        if not task_id:
+            raise TeamError(f"task-create missing id: {json.dumps(task_payload)[:500]}")
+        start_payload = orca_json(
+            orca,
+            [
+                "orchestration",
+                "worker-start",
+                "--task",
+                task_id,
+                "--worktree",
+                "current",
+                "--agent",
+                agent_id,
+                "--from",
+                orch_handle,
+                "--run",
+                run_id,
+            ],
+        )
+        start_res = unwrap(start_payload)
+        worker_info = start_res.get("worker") or start_res
+        new_handle = (
+            worker_info.get("agent_terminal_handle")
+            or worker_info.get("handle")
+            or (start_res.get("dispatch") or {}).get("assignee_handle")
+        )
+        if not new_handle:
+            raise TeamError(f"worker-start returned no handle: {json.dumps(start_payload)[:800]}")
+        member["handle"] = str(new_handle)
+        member["deferred"] = False
+        member.pop("deferredReason", None)
+        clear_role_injected(member)
+        handle = member["handle"]
+        live_handles.add(str(handle))
+        planned["spawnedHandle"] = handle
+        planned["taskId"] = task_id
+        # Platform may have injected once; still send lean card with ids if dispatch present.
+        dispatch = start_res.get("dispatch") or {}
+        dispatch_id = str(dispatch.get("id") or dispatch.get("dispatchId") or "")
+        # Mark role: worker-start inject is not our full role bible — inject role once.
+        needs_role = True
+    else:
+        task_id = (args.task_id or "").strip()
+        dispatch_id = ""
+        needs_role = member_needs_role_inject(
+            member, live_handles=live_handles, force=force_role
+        )
+        if not handle:
+            raise TeamError(
+                f"worker {agent_id} has no live handle; omit --dry-run to spawn, "
+                "or start the team with that worker open"
+            )
+
+    planned["needsRole"] = bool(needs_role)
+    planned["mode"] = "role-once" if needs_role else "lean"
+    planned["handle"] = handle
+
+    spec = (args.spec or "").strip()
+    if not spec and not planned.get("taskId"):
+        raise TeamError("--spec required (task goal text)")
+
+    if dry_run:
+        card_preview = build_lean_task_card(
+            goal=spec or "(existing task)",
+            in_scope=args.in_scope or "",
+            out_scope=args.out_scope or "",
+            done_criteria=args.done or "",
+            run_id=run_id,
+            task_id=planned.get("taskId") or task_id or "task_DRY",
+            dispatch_id=dispatch_id or "ctx_DRY",
+            mode=planned["mode"],
+        )
+        planned["cardPreview"] = card_preview
+        planned["dispatchInject"] = False
+        if as_json:
+            print(json.dumps(planned, indent=2))
+        else:
+            print(f"assign dry-run → {agent_id} handle={handle}")
+            print(f"  mode:        {planned['mode']}")
+            print(f"  needsRole:   {planned['needsRole']}")
+            print(f"  needsSpawn:  {planned['needsSpawn']}")
+            print("  dispatch:    without --inject")
+            print("  card:")
+            for line in card_preview.splitlines():
+                print(f"    {line}")
+        return 0
+
+    # Role-once for primed/fresh pane (not already handled by worker-start path above
+    # when we still need our role bible after spawn).
+    if needs_role:
+        templates = load_role_templates()
+        wait_agent_ready(orca, str(handle), agent_id=agent_id)
+        prompt = build_role_prompt(
+            templates=templates,
+            member=member,
+            run_id=run_id,
+            objective=str(state.get("objective") or ""),
+            worktree_path=worktree_path,
+            orch_handle=orch_handle,
+            roster=roster_from_members(list(state.get("members") or [])),
+        )
+        terminal_send(orca, str(handle), prompt)
+        mark_role_injected(member, str(handle))
+        time.sleep(0.4)
+
+    # Create task + lean dispatch when we did not already create during spawn.
+    if planned.get("taskId"):
+        task_id = str(planned["taskId"])
+        if not dispatch_id:
+            show = orca_json(
+                orca,
+                ["orchestration", "dispatch-show", "--task", task_id],
+                check=False,
+            )
+            if show.get("ok"):
+                shown = unwrap(show)
+                if isinstance(shown, dict):
+                    dispatch_id = str(
+                        shown.get("id")
+                        or (shown.get("dispatch") or {}).get("id")
+                        or ""
+                    )
+    else:
+        if args.task_id:
+            task_id = str(args.task_id).strip()
+        else:
+            task_payload = orca_json(
+                orca,
+                [
+                    "orchestration",
+                    "task-create",
+                    "--spec",
+                    f"[{agent_id}] {spec}",
+                    "--from",
+                    orch_handle,
+                    "--run",
+                    run_id,
+                ],
+            )
+            task = unwrap(task_payload).get("task") or unwrap(task_payload)
+            task_id = str(task.get("id") or task.get("taskId") or "")
+            if not task_id:
+                raise TeamError(
+                    f"task-create missing id: {json.dumps(task_payload)[:500]}"
+                )
+
+        dispatch_payload = orca_json(
+            orca,
+            [
+                "orchestration",
+                "dispatch",
+                "--task",
+                task_id,
+                "--to",
+                str(handle),
+                "--from",
+                orch_handle,
+                "--run",
+                run_id,
+                # intentionally NO --inject (lean path)
+            ],
+        )
+        dispatch = unwrap(dispatch_payload).get("dispatch") or unwrap(dispatch_payload)
+        dispatch_id = str(dispatch.get("id") or dispatch.get("dispatchId") or "")
+
+    card = build_lean_task_card(
+        goal=spec or f"Continue task {task_id}",
+        in_scope=args.in_scope or "",
+        out_scope=args.out_scope or "",
+        done_criteria=args.done or "",
+        run_id=run_id,
+        task_id=task_id,
+        dispatch_id=dispatch_id,
+        mode=planned["mode"],
+    )
+    wait_agent_ready(orca, str(handle), agent_id=agent_id)
+    terminal_send(orca, str(handle), card)
+
+    member["lastAssignAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    member["lastAssignMode"] = planned["mode"]
+    member["lastTaskId"] = task_id
+    save_state(worktree_path, state)
+
+    result = {
+        "ok": True,
+        "worker": agent_id,
+        "handle": handle,
+        "runId": run_id,
+        "taskId": task_id,
+        "dispatchId": dispatch_id,
+        "mode": planned["mode"],
+        "marker": LEAN_ASSIGN_MARKER,
+    }
+    if as_json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"assigned → {agent_id} [{planned['mode']}]")
+        print(f"  handle:     {handle}")
+        print(f"  taskId:     {task_id}")
+        print(f"  dispatchId: {dispatch_id or '(none)'}")
+        print(f"  marker:     {LEAN_ASSIGN_MARKER}")
     return 0
 
 
@@ -2329,9 +3059,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     for member in state.get("members") or []:
         handle = member.get("handle")
         presence = "live" if handle in live_handles else ("unknown" if not live.get("ok") else "missing")
+        role_note = ""
+        if member.get("role") == "worker":
+            inj = member.get("roleInjectedHandle")
+            if inj and handle and str(inj) == str(handle):
+                role_note = " role=injected"
+            elif handle:
+                role_note = " role=fresh"
+            mode = member.get("lastAssignMode")
+            if mode:
+                role_note += f" lastAssign={mode}"
         print(
             f"    - {member.get('role')}:{member.get('agentId')} "
-            f"handle={handle} [{presence}]"
+            f"handle={handle} [{presence}]{role_note}"
         )
 
     if state.get("runId"):
@@ -2964,10 +3704,76 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WATCH_STALE_MINUTES,
         help=f"Auto-watch stale threshold in minutes (default: {DEFAULT_WATCH_STALE_MINUTES})",
     )
+    start.add_argument(
+        "--min-remaining",
+        type=float,
+        default=DEFAULT_MIN_REMAINING_PERCENT,
+        help=(
+            "Do not open worker panes below this remaining usage %% "
+            f"(default: {DEFAULT_MIN_REMAINING_PERCENT}). Grok/Claude probed; others unknown=allow."
+        ),
+    )
+    start.add_argument(
+        "--ignore-quota",
+        action="store_true",
+        help="Open all requested workers even if usage probe says remaining is low",
+    )
     start.set_defaults(func=cmd_start)
 
     status = sub.add_parser("status", help="Show team state for the current worktree")
     status.set_defaults(func=cmd_status)
+
+    assign = sub.add_parser(
+        "assign",
+        help=(
+            "Lean-assign a task to a roster worker: role once per fresh pane, "
+            "then short task card (no fat dispatch --inject)"
+        ),
+    )
+    assign.add_argument(
+        "--worker",
+        required=True,
+        help="Worker agent id or terminal handle from the team roster",
+    )
+    assign.add_argument(
+        "--spec",
+        default="",
+        help="Task goal/spec text (required unless --task-id on a primed pane)",
+    )
+    assign.add_argument("--task-id", default="", help="Reuse an existing orchestration task id")
+    assign.add_argument("--in-scope", default="", help="In-scope paths (card field)")
+    assign.add_argument("--out-scope", default="", help="Out-of-scope paths (card field)")
+    assign.add_argument("--done", default="", help="Done criteria (card field)")
+    assign.add_argument(
+        "--force-role",
+        action="store_true",
+        help="Re-send the full worker role bible before the card",
+    )
+    assign.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned role/dispatch/card actions without sending",
+    )
+    assign.add_argument("--json", action="store_true", help="Emit JSON")
+    assign.set_defaults(func=cmd_assign)
+
+    usage_cmd = sub.add_parser(
+        "usage",
+        help="Probe remaining usage/quota for roster agents (grok/claude)",
+    )
+    usage_cmd.add_argument(
+        "--agents",
+        default="",
+        help="Comma-separated agent ids (default: current team roster or start defaults)",
+    )
+    usage_cmd.add_argument(
+        "--min-remaining",
+        type=float,
+        default=DEFAULT_MIN_REMAINING_PERCENT,
+        help=f"Mark LOW below this remaining %% (default: {DEFAULT_MIN_REMAINING_PERCENT})",
+    )
+    usage_cmd.add_argument("--json", action="store_true", help="Emit JSON")
+    usage_cmd.set_defaults(func=cmd_usage)
 
     open_cmd = sub.add_parser(
         "open",
@@ -2983,6 +3789,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--orchestrator-only",
         action="store_true",
         help="Only reinject the orchestrator prompt",
+    )
+    reinject.add_argument(
+        "--force-role",
+        action="store_true",
+        help="Workers: re-send full role bible (default is short lean reminder)",
     )
     reinject.set_defaults(func=cmd_reinject)
 
