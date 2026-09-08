@@ -2559,7 +2559,7 @@ def cmd_assign(args: argparse.Namespace) -> int:
 
     # Fresh spawn when deferred / no live handle.
     handle = member.get("handle")
-    needs_spawn = (
+    needs_spawn = bool(
         member.get("deferred")
         or not handle
         or (handle and str(handle) not in live_handles and live_handles)
@@ -2567,11 +2567,43 @@ def cmd_assign(args: argparse.Namespace) -> int:
     planned: dict[str, Any] = {
         "worker": agent_id,
         "runId": run_id,
-        "needsSpawn": bool(needs_spawn),
+        "needsSpawn": needs_spawn,
         "needsRole": False,
         "mode": "lean",
         "dryRun": dry_run,
     }
+
+    if needs_spawn and dry_run:
+        planned["needsRole"] = True
+        planned["mode"] = "role-once"
+        planned["handle"] = handle
+        planned["dispatchInject"] = False
+        planned["note"] = (
+            "Would spawn via worker-start --agent (one platform inject possible), "
+            "then inject full worker role once and send lean card."
+        )
+        card_preview = build_lean_task_card(
+            goal=(args.spec or "").strip() or "(spawn task)",
+            in_scope=args.in_scope or "",
+            out_scope=args.out_scope or "",
+            done_criteria=args.done or "",
+            run_id=run_id,
+            task_id="task_DRY",
+            dispatch_id="ctx_DRY",
+            mode="role-once",
+        )
+        planned["cardPreview"] = card_preview
+        if as_json:
+            print(json.dumps(planned, indent=2))
+        else:
+            print(f"assign dry-run → {agent_id} (would spawn fresh pane)")
+            print(f"  mode:        role-once")
+            print(f"  needsSpawn:  True")
+            print("  dispatch:    without --inject after spawn")
+            print("  card:")
+            for line in card_preview.splitlines():
+                print(f"    {line}")
+        return 0
 
     if needs_spawn and not dry_run:
         # Create task first so worker-start has something to bind (may fat-inject once).
