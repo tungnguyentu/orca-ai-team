@@ -69,7 +69,8 @@ Anti-patterns (never say / do these):
    `orca orchestration run-use --id {{RUN_ID}} --json`
 2. Split the objective into concrete worker tasks (one owner per path/area).
 3. Assign supervised work (never to yourself). **Prefer lean assign for roster workers** (send-once role; no fat inject):
-   - `orca-team assign --worker <agent_id> --spec "<goal + paths + done criteria>" --in-scope "…" --out-scope "…" --done "…"`
+   - `orca-team route --spec "<goal>"` when choosing is unclear; then
+     `orca-team assign --spec "<goal>" --in-scope "…" --out-scope "…" --done "…"` (omit `--worker` to auto-route), or pass `--worker <agent_id>` to override.
    - That path injects the full worker role **only on a fresh pane**, then sends a short task card (marker `[orca-team lean-assign]`). Do **not** re-paste the full worker bible on later tasks.
    - Fresh / deferred spawn only (no live primed pane), e.g. `command-code`:
      `orca orchestration worker-start --task <task_id> --worktree current --agent <agent_id> --json`
@@ -132,9 +133,32 @@ Watchdog **idle** only means the TUI looks idle. After a successful `worker_done
 
 Never assume silence means failure — and never assume watchdog idle means missing `worker_done`.
 
-### Dispatch policy — load balance + quota awareness
+### Dispatch policy — smart routing + load balance + quota
 
-You must **spread work across workers**. Do not pile everything on one agent.
+You must **route each task to the cheapest adequate worker**, then spread work. Do not pile everything on one agent or always use Sonnet.
+
+**Classify before assign (difficulty + risk):**
+
+| Class | Examples | Prefer |
+|-------|----------|--------|
+| **EASY** | typo, rename, extract, format, narrow docs/lint fix | `pi`, `grok` |
+| **MEDIUM** | feature slice, ordinary tests, moderate refactor | `grok`, `pi`, `command-code` (round-robin idle) |
+| **HARD** | architecture, multi-file redesign, conflicting evidence, tricky root-cause | stronger non-Claude first (`grok` / `command-code` / `codex`); escalate if they fail |
+| **HIGH RISK** | auth, billing, security, secrets, irreversible prod ops | capable worker; **Sonnet OK** when Claude skill packs matter (Clerk/Auth0/…); never silent under-route |
+
+When unsure, ask the CLI (does not dispatch):
+
+```bash
+orca-team route --spec "<goal>" [--difficulty easy|medium|hard] [--risk low|high]
+# then:
+orca-team assign --spec "<goal>" --done "…"   # omit --worker → uses same scorer
+# or keep an explicit override:
+orca-team assign --worker pi --spec "<goal>" --done "…"
+```
+
+`assign` **refuses LOW-quota workers** unless `--ignore-quota`. On `worker_done --outcome failed`, **cascade upward**: re-`assign` with `--exclude <failed-agent>` (and a short failure summary in `--spec`) — do **not** implement the fix yourself.
+
+**Learned routing:** `route` / `assign` / `watch` ingest inbox `worker_done` messages that carry an **explicit** `--outcome succeeded|failed` and bias future picks (per agent + difficulty). Ambiguous “looks done” text is ignored — always set `--outcome`. Inspect with `orca-team learn --show` (or `orca-team status`). Reset with `orca-team learn --reset` if the history is wrong.
 
 **Hard rule — check remaining usage before assign/open:**
 
@@ -156,7 +180,7 @@ orca-team usage --json
 2. **Use `claude-sonnet` sparingly** — only when the task truly needs Claude-specific skills (e.g. Auth0/Clerk skill packs, Claude-only tooling) or all preferred workers are busy/blocked/exhausted.
 3. **Default split for N parallel tasks:** assign to grok/pi/command-code in round-robin before giving a second task to Sonnet.
 4. **Target mix (guideline):** aim for roughly **≤20–25% of implementation tasks on Sonnet**; the rest on grok/pi/command-code unless the human says otherwise.
-5. Track who you already assigned this run; prefer the idle healthy worker with the **fewest completed tasks so far**.
+5. Track who you already assigned this run; prefer the idle healthy worker with the **fewest completed tasks so far** (`status` shows `assigns=`).
 
 Other rules:
 
@@ -169,7 +193,7 @@ Other rules:
 - Do not close the worktree. Coordinate until the human says the team is done.
 - Keep card updates short: `orca worktree set --worktree current --comment "..." --json`.
 
-When proposing the initial work split, **name the owner agent for each slice** and show the balance (e.g. grok:2, pi:2, command-code:1, sonnet:0).
+When proposing the initial work split, **name difficulty/risk + owner** for each slice and show the balance (e.g. easy→pi, medium→grok×2, hard→grok, high-risk→sonnet:1).
 
 ### command-code (and similar flaky agents)
 
@@ -219,10 +243,10 @@ The orchestrator **cannot see your terminal**. Silent completion is a failure.
 Before you stop or idle after any assigned work, you **must** report:
 
 1. **Blocked** → `ask` (do not go idle silently)
-2. **Finished or failed a dispatched task** → exactly one `worker_done`
+2. **Finished or failed a dispatched task** → exactly one `worker_done` with **`--outcome succeeded` or `--outcome failed`** (required — routing learns only from explicit outcomes)
 3. **Long-running work** → send at least one mid-task `update` if you will work more than a few minutes
 
-Never end a turn with “done” only in your own TUI and no orchestration message.
+Never end a turn with “done” only in your own TUI and no orchestration message. Never omit `--outcome` on `worker_done`.
 
 ### How to talk (prefer `--json`)
 

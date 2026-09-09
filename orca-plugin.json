@@ -3,7 +3,7 @@
   "id": "orca-ai-team",
   "publisher": "tungnguyentu",
   "name": "Orca AI Team",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Start a multi-agent team room (Opus orchestrator + workers) via orca-team in the focused worktree.",
   "author": {
     "name": "Tung Nguyen Tu",

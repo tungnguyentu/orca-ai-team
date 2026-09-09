@@ -73,10 +73,15 @@ orca-team start --objective "<goal>"   # dual layout; uses config defaults
 # persist this run: --save-defaults
 orca-team status
 orca-team usage                # remaining % for grok/claude; LOW ⇒ do not assign
-orca-team assign --worker pi --spec "…" --done "…"   # lean: role once + short card
+orca-team route --spec "…"     # rank workers by difficulty/risk/quota + learned outcomes
+orca-team learn                # ingest explicit worker_done outcomes into routingLearn
+orca-team learn --show         # show stored success/fail stats
+orca-team assign --spec "…" --done "…"   # omit --worker → auto-route; lean card
+orca-team assign --worker pi --spec "…" --done "…"   # explicit worker override
 orca-team open                 # host focus + remote-viewer hints
 # start enables background watch by default (--no-watch to disable)
 # start defers workers below --min-remaining (default 10%)
+# assign refuses LOW-quota workers unless --ignore-quota
 orca-team watch --once --idle-check   # extra one-shot nudge
 orca-team watch --interval 60 --stale-minutes 10 --idle-check
 orca-team reinject             # workers get short reminder; --force-role for full bible
@@ -106,14 +111,17 @@ Source of truth: `references/role-prompts.md`.
 
 - **Plans, splits, dispatches, answers `ask`, synthesizes.**
 - **Must not** implement product code / “just quickly fix it”.
-- Assign with **`orca-team assign --worker <id> --spec "…"`** for primed roster panes (send-once role; short card; no fat `--inject`). Use `worker-start --agent` only for fresh/deferred panes.
+- Assign with **`orca-team assign --spec "…"`** (auto-route) or **`--worker <id>`** for primed roster panes (send-once role; short card; no fat `--inject`). Use `worker-start --agent` only for fresh/deferred panes.
+- **Route by difficulty/risk:** easy→pi/grok; medium→grok/pi/command-code; hard→stronger non-Claude first; high-risk (auth/billing/security)→capable worker (Sonnet OK for Claude skills). Use `orca-team route --spec "…"` when unsure.
+- On **`worker_done --outcome failed`**, cascade: re-assign with `--exclude <failed-agent>` — do not implement yourself.
+- **Learned routing:** only explicit `worker_done --outcome succeeded|failed` trains the scorer (`orca-team learn` / auto-ingest on route/assign/watch). Prefer `--outcome` always so history stays honest.
 - Wait with `check --wait --types worker_done,escalation,question`.
 - **Answer worker `ask` / `question` immediately** (`reply`) — highest priority. An unanswered ask freezes that worker.
 - **Never claim a worker is quiet / missing `worker_done` without `check` + `dispatch-show`.** Watchdog idle after a real `worker_done` is normal; `dispatch-show` null means settled.
-- **Check `orca-team usage` before assign/open.** If grok/claude remaining is low (e.g. &lt;10%), do not dispatch or `worker-start` that agent — pick another healthy worker.
+- **Check `orca-team usage` before assign/open.** If grok/claude remaining is low (e.g. &lt;10%), do not dispatch or `worker-start` that agent — pick another healthy worker. `assign` also refuses LOW quota unless `--ignore-quota`.
 - **Never invent a human-approval gate.** Dispatch in the same turn as the split unless the human explicitly said to wait. Idle workers = orchestrator failure — do not claim “I’m the bottleneck / pending your approval.”
 
-**Load balance + Claude quota:** Opus (orchestrator) and Sonnet share one Claude usage pool. Prefer **`grok` / `pi` / `command-code`** for most implementation; use **Sonnet sparingly** (≤ ~20–25% of tasks) unless the work needs Claude-specific skills. Round-robin across non-Claude workers; prefer the idle worker with the fewest assignments so far.
+**Load balance + Claude quota:** Opus (orchestrator) and Sonnet share one Claude usage pool. Prefer **`grok` / `pi` / `command-code`** for most implementation; use **Sonnet sparingly** (≤ ~20–25% of tasks) unless the work needs Claude-specific skills. Round-robin across non-Claude workers; prefer the idle worker with the fewest assignments so far (`status` shows `assigns=`).
 
 If the orchestrator drifts into coding, parks workers behind fake approval gates, or overloads Sonnet:
 

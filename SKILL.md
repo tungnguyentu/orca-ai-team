@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.3.0
+version: 0.3.2
 
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus
@@ -44,14 +44,19 @@ orca-team start --objective "Ship feature X"
 # Talk in the orchestrator tab (`ai-team:orch`) inside Orca.
 orca-team status
 orca-team usage                 # probe grok/claude remaining % before assign
+orca-team route --spec "Implement X"   # rank workers (difficulty/risk/quota + learned); no dispatch
+orca-team learn                        # ingest explicit worker_done --outcome into routingLearn
+orca-team assign --spec "Implement X" --done "tests pass"   # omit --worker → auto-route
 orca-team assign --worker pi --spec "Implement X" --done "tests pass"
 # lean path: full worker role once per fresh pane; later tasks = short card (no fat --inject)
+# assign refuses LOW-quota workers unless --ignore-quota; --exclude for cascade after failure
+# learned bias needs explicit --outcome succeeded|failed (fluent text alone is ignored)
 orca-team send --to run --subject "standup" --body "Status check"
 orca-team stop   # writes AI-TEAM-HANDOFF.md + deletes watch log
 # next start loads AI-TEAM-HANDOFF.md into the orchestrator automatically
 ```
 
-Prefer `orca-team assign` for roster workers (send-once role + short `[orca-team lean-assign]` card). Avoid re-pasting the full worker bible or `dispatch --inject` on primed panes.
+Prefer `orca-team assign` for roster workers (send-once role + short `[orca-team lean-assign]` card). Omit `--worker` to let the scorer pick (easy→pi/grok, spare Sonnet, respect quota). Avoid re-pasting the full worker bible or `dispatch --inject` on primed panes.
 
 `start` skips opening workers under `--min-remaining` (default 10%). Example: grok at 4% left is deferred (no pane) until quota recovers. Orchestrator must also run `orca-team usage` before dispatching.
 
@@ -149,10 +154,28 @@ Answer pending questions first: check --peek --types question, then reply --id �
 
 ### Keep work balanced (and spare Claude quota)
 
-Opus + Sonnet share Claude usage. Prefer dispatching to **grok / pi / command-code**; use Sonnet only when needed. Say so to the orchestrator, or reinject:
+Opus + Sonnet share Claude usage. Prefer dispatching to **grok / pi / command-code**; use Sonnet only when needed (Claude skills / high-risk). Route with difficulty in mind (easy→pi/grok). Say so to the orchestrator, or reinject:
 
 ```text
-Prefer grok and pi for implementation. Minimize sonnet — same Claude quota as the orchestrator. Round-robin non-Claude workers.
+Prefer grok and pi for implementation. Minimize sonnet — same Claude quota as the orchestrator. Use orca-team route / assign without --worker. Round-robin non-Claude workers.
+```
+
+### Worker failed — cascade, don’t code
+
+On `worker_done --outcome failed`, reassign upward (exclude the failed agent) instead of implementing:
+
+```bash
+orca-team assign --spec "RETRY after <agent> failed: …" --exclude <failed-agent> --done "…"
+```
+
+### Learned routing
+
+Successful/failed outcomes with an **explicit** `--outcome` are stored in `.orca/ai-team.json` (`routingLearn`) and bias later `route`/`assign` picks. Watch also ingests in the background.
+
+```bash
+orca-team learn --show
+orca-team learn --reset          # wipe bad history
+orca-team route --spec "…" --no-learned   # one-shot ignore bias
 ```
 
 ### Workers forget to send results back

@@ -2572,10 +2572,13 @@ def roster_from_members(members: list[dict[str, Any]]) -> str:
                     f"- {agent_id}: DEFERRED (no live pane) — spawn with `{hint}`"
                 )
         else:
+            ac = member.get("assignCount")
+            ac_note = f" assigns={ac}" if ac else ""
             lines.append(
-                f"- {agent_id}: handle `{member.get('handle')}` title `{member.get('title')}`"
+                f"- {agent_id}: handle `{member.get('handle')}` title `{member.get('title')}`{ac_note}"
             )
-    return "\n".join(lines) if lines else "- (no workers)"
+    body = "\n".join(lines) if lines else "- (no workers)"
+    return f"{body}\n\nRouting: {ROUTING_CHEATSHEET}"
 
 
 def cmd_usage(args: argparse.Namespace) -> int:
@@ -2796,6 +2799,940 @@ def cmd_reinject(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Smart worker routing (task → cheapest adequate worker) ---------------
+
+ROUTING_CHEATSHEET = (
+    "Route by difficulty/risk + quota + learned outcomes: "
+    "EASY→pi/grok | MEDIUM→grok/pi/command-code | HARD→stronger non-Claude first | "
+    "HIGH-RISK→capable (Sonnet OK for Claude skills) | "
+    "`orca-team route/learn`; on worker_done failed → escalate upward."
+)
+
+# Learned routing: only explicit worker_done outcomes bias future picks.
+LEARNED_MIN_SAMPLES = 2
+LEARNED_MAX_BIAS = 15.0
+LEARNED_SEEN_ID_CAP = 300
+LEARNED_PENDING_CAP = 80
+
+_EASY_HINTS = (
+    "typo",
+    "rename",
+    "extract",
+    "format",
+    "classify",
+    "summarize briefly",
+    "one-line",
+    "readme",
+    "comment",
+    "docs only",
+    "whitespace",
+    "lint",
+)
+_HARD_HINTS = (
+    "architect",
+    "architecture",
+    "redesign",
+    "multi-file",
+    "cross-cutting",
+    "race condition",
+    "deadlock",
+    "perf regression",
+    "security audit",
+    "migrate",
+    "data model",
+    "conflicting",
+    "root cause",
+    "complex",
+)
+_HIGH_RISK_HINTS = (
+    "auth",
+    "authentication",
+    "authorization",
+    "oauth",
+    "clerk",
+    "auth0",
+    "billing",
+    "payment",
+    "stripe",
+    "security",
+    "secret",
+    "credential",
+    "password",
+    "crypto",
+    "production",
+    "irreversible",
+    "delete all",
+    "drop table",
+    "gdpr",
+)
+_CLAUDE_AFFINITY_HINTS = (
+    "clerk",
+    "auth0",
+    "claude skill",
+    "anthropic",
+    "mcp serena",
+)
+
+
+def _spec_blob(*parts: str) -> str:
+    return " ".join(p.strip().lower() for p in parts if p and str(p).strip())
+
+
+def _hint_hit(blob: str, hints: tuple[str, ...]) -> str | None:
+    for h in hints:
+        if h in blob:
+            return h
+    return None
+
+
+def infer_difficulty(spec: str, *, explicit: str | None = None) -> str:
+    """Return easy|medium|hard from flag or lightweight keyword heuristics."""
+    if explicit:
+        d = explicit.strip().lower()
+        if d in {"easy", "medium", "hard"}:
+            return d
+        raise TeamError(f"invalid difficulty '{explicit}' (use easy|medium|hard)")
+    blob = _spec_blob(spec)
+    if not blob:
+        return "medium"
+    if _hint_hit(blob, _HARD_HINTS):
+        return "hard"
+    if _hint_hit(blob, _EASY_HINTS):
+        return "easy"
+    return "medium"
+
+
+def infer_risk(spec: str, *, explicit: str | None = None) -> str:
+    """Return low|high from flag or keyword heuristics."""
+    if explicit:
+        r = explicit.strip().lower()
+        if r in {"low", "high"}:
+            return r
+        raise TeamError(f"invalid risk '{explicit}' (use low|high)")
+    blob = _spec_blob(spec)
+    if _hint_hit(blob, _HIGH_RISK_HINTS):
+        return "high"
+    return "low"
+
+
+def _base_affinity(agent_id: str, difficulty: str) -> float:
+    """Higher = preferred for this difficulty (before adjustments)."""
+    tables: dict[str, dict[str, float]] = {
+        "easy": {
+            "pi": 100.0,
+            "grok": 95.0,
+            "command-code": 70.0,
+            "claude-sonnet": 35.0,
+            "sonnet": 35.0,
+            "claude": 35.0,
+            "codex": 60.0,
+            "opencode": 55.0,
+        },
+        "medium": {
+            "grok": 100.0,
+            "pi": 95.0,
+            "command-code": 85.0,
+            "claude-sonnet": 45.0,
+            "sonnet": 45.0,
+            "claude": 45.0,
+            "codex": 70.0,
+            "opencode": 65.0,
+        },
+        "hard": {
+            "grok": 92.0,
+            "pi": 80.0,
+            "command-code": 78.0,
+            "claude-sonnet": 70.0,
+            "sonnet": 70.0,
+            "claude": 70.0,
+            "codex": 75.0,
+            "opencode": 68.0,
+        },
+    }
+    table = tables.get(difficulty) or tables["medium"]
+    if agent_id in table:
+        return table[agent_id]
+    if is_claude_agent(agent_id):
+        return table.get("claude-sonnet", 45.0)
+    return 60.0
+
+
+def ensure_routing_learn(state: dict[str, Any]) -> dict[str, Any]:
+    """Return mutable routingLearn blob on state (creates if missing)."""
+    rl = state.get("routingLearn")
+    if not isinstance(rl, dict):
+        rl = {"version": 1, "seenIds": [], "agents": {}}
+        state["routingLearn"] = rl
+    rl.setdefault("version", 1)
+    if not isinstance(rl.get("seenIds"), list):
+        rl["seenIds"] = []
+    if not isinstance(rl.get("agents"), dict):
+        rl["agents"] = {}
+    return rl
+
+
+def ensure_pending_routes(state: dict[str, Any]) -> dict[str, Any]:
+    pr = state.get("pendingRoutes")
+    if not isinstance(pr, dict):
+        pr = {}
+        state["pendingRoutes"] = pr
+    return pr
+
+
+def _agent_stats(rl: dict[str, Any], agent_id: str) -> dict[str, Any]:
+    agents = rl.setdefault("agents", {})
+    st = agents.get(agent_id)
+    if not isinstance(st, dict):
+        st = {
+            "succeeded": 0,
+            "failed": 0,
+            "byDifficulty": {
+                "easy": {"succeeded": 0, "failed": 0},
+                "medium": {"succeeded": 0, "failed": 0},
+                "hard": {"succeeded": 0, "failed": 0},
+            },
+            "byRisk": {
+                "low": {"succeeded": 0, "failed": 0},
+                "high": {"succeeded": 0, "failed": 0},
+            },
+        }
+        agents[agent_id] = st
+    st.setdefault("succeeded", 0)
+    st.setdefault("failed", 0)
+    by_d = st.setdefault("byDifficulty", {})
+    for d in ("easy", "medium", "hard"):
+        bucket = by_d.get(d)
+        if not isinstance(bucket, dict):
+            by_d[d] = {"succeeded": 0, "failed": 0}
+        else:
+            bucket.setdefault("succeeded", 0)
+            bucket.setdefault("failed", 0)
+    by_r = st.setdefault("byRisk", {})
+    for r in ("low", "high"):
+        bucket = by_r.get(r)
+        if not isinstance(bucket, dict):
+            by_r[r] = {"succeeded": 0, "failed": 0}
+        else:
+            bucket.setdefault("succeeded", 0)
+            bucket.setdefault("failed", 0)
+    return st
+
+
+def _bump_bucket(bucket: dict[str, Any], outcome: str) -> None:
+    key = "succeeded" if outcome == "succeeded" else "failed"
+    bucket[key] = int(bucket.get(key) or 0) + 1
+
+
+def record_route_outcome(
+    state: dict[str, Any],
+    *,
+    agent_id: str,
+    outcome: str,
+    difficulty: str | None = None,
+    risk: str | None = None,
+    task_id: str | None = None,
+    message_id: str | None = None,
+) -> bool:
+    """
+    Record one explicit succeeded|failed outcome. Returns False if skipped
+    (ambiguous outcome, duplicate message id, or empty agent).
+    """
+    agent_id = (agent_id or "").strip()
+    if not agent_id:
+        return False
+    oc = (outcome or "").strip().lower()
+    if oc not in {"succeeded", "failed"}:
+        return False
+    rl = ensure_routing_learn(state)
+    seen: list[str] = list(rl.get("seenIds") or [])
+    if message_id:
+        mid = str(message_id)
+        if mid in seen:
+            return False
+        seen.append(mid)
+        if len(seen) > LEARNED_SEEN_ID_CAP:
+            seen = seen[-LEARNED_SEEN_ID_CAP:]
+        rl["seenIds"] = seen
+
+    st = _agent_stats(rl, agent_id)
+    _bump_bucket(st, oc)
+    diff = (difficulty or "").strip().lower()
+    if diff in {"easy", "medium", "hard"}:
+        _bump_bucket(st["byDifficulty"][diff], oc)
+    rsk = (risk or "").strip().lower()
+    if rsk in {"low", "high"}:
+        _bump_bucket(st["byRisk"][rsk], oc)
+    st["lastOutcome"] = oc
+    st["lastAt"] = utc_now()
+    if task_id:
+        st["lastTaskId"] = str(task_id)
+    return True
+
+
+def remember_pending_route(
+    state: dict[str, Any],
+    *,
+    task_id: str,
+    agent_id: str,
+    difficulty: str,
+    risk: str,
+) -> None:
+    task_id = (task_id or "").strip()
+    if not task_id:
+        return
+    pending = ensure_pending_routes(state)
+    pending[task_id] = {
+        "agentId": agent_id,
+        "difficulty": difficulty,
+        "risk": risk,
+        "assignedAt": utc_now(),
+    }
+    # Cap map size (drop oldest by assignedAt).
+    if len(pending) > LEARNED_PENDING_CAP:
+        ordered = sorted(
+            pending.items(),
+            key=lambda kv: str((kv[1] or {}).get("assignedAt") or ""),
+        )
+        for key, _ in ordered[: max(0, len(pending) - LEARNED_PENDING_CAP)]:
+            pending.pop(key, None)
+
+
+def parse_worker_done_outcome(msg: dict[str, Any]) -> str | None:
+    """
+    Extract explicit succeeded|failed only. Ambiguous fluent reports → None
+    (do not train on unverified success).
+    """
+    for key in ("outcome", "result_outcome", "status"):
+        raw = msg.get(key)
+        if isinstance(raw, str):
+            v = raw.strip().lower()
+            if v in {"succeeded", "success", "ok", "passed"}:
+                return "succeeded"
+            if v in {"failed", "failure", "error", "fail"}:
+                return "failed"
+    payload = msg.get("payload")
+    if isinstance(payload, dict):
+        raw = payload.get("outcome")
+        if isinstance(raw, str):
+            v = raw.strip().lower()
+            if v in {"succeeded", "success", "ok", "passed"}:
+                return "succeeded"
+            if v in {"failed", "failure", "error", "fail"}:
+                return "failed"
+    # Body / subject markers from orchestration CLI flags.
+    blob = f"{msg.get('subject') or ''} {msg.get('body') or ''}".lower()
+    if re.search(r"(?:--outcome\s+failed|\boutcome\s*[:=]\s*failed|\bfailed\b.+\bworker_done\b|\bworker_done\b.+\bfailed\b)", blob):
+        return "failed"
+    if re.search(r"(?:--outcome\s+succeeded|\boutcome\s*[:=]\s*succeeded)", blob):
+        return "succeeded"
+    # Bare "succeeded"/"failed" as a dedicated token near the start is weak; skip.
+    return None
+
+
+def _resolve_agent_id_from_handle(
+    members: list[dict[str, Any]], handle: str
+) -> str | None:
+    handle = (handle or "").strip()
+    if not handle:
+        return None
+    for m in members:
+        if str(m.get("handle") or "") == handle:
+            aid = str(m.get("agentId") or "").strip()
+            return aid or None
+    return None
+
+
+def ingest_worker_done_outcomes(
+    orca: str,
+    state: dict[str, Any],
+    *,
+    orch_handle: str,
+    limit: int = 40,
+) -> dict[str, Any]:
+    """
+    Scan orchestration inbox for worker_done with explicit outcomes and update
+    routingLearn. Idempotent via seen message ids.
+    """
+    summary: dict[str, Any] = {
+        "scanned": 0,
+        "ingested": 0,
+        "skippedAmbiguous": 0,
+        "skippedDuplicate": 0,
+        "skippedNoAgent": 0,
+    }
+    if not orch_handle:
+        return summary
+    run_id = str(state.get("runId") or "")
+    if run_id:
+        orca_json(
+            orca,
+            ["orchestration", "run-use", "--id", run_id, "--from", orch_handle],
+            check=False,
+        )
+    payload = orca_json(
+        orca,
+        ["orchestration", "inbox", "--limit", str(limit), "--from", orch_handle],
+        check=False,
+    )
+    if not payload.get("ok"):
+        payload = orca_json(
+            orca,
+            ["orchestration", "inbox", "--limit", str(limit)],
+            check=False,
+        )
+    if not payload.get("ok"):
+        summary["error"] = "inbox unavailable"
+        return summary
+    result = unwrap(payload)
+    msgs = result.get("messages") or result.get("items") or []
+    if not isinstance(msgs, list):
+        return summary
+
+    members = list(state.get("members") or [])
+    pending = ensure_pending_routes(state)
+    rl = ensure_routing_learn(state)
+    seen = set(str(x) for x in (rl.get("seenIds") or []))
+
+    for msg in msgs:
+        if not isinstance(msg, dict):
+            continue
+        mtype = str(msg.get("type") or "")
+        if mtype != "worker_done":
+            continue
+        summary["scanned"] += 1
+        mid = str(msg.get("id") or "")
+        if mid and mid in seen:
+            summary["skippedDuplicate"] += 1
+            continue
+        outcome = parse_worker_done_outcome(msg)
+        if outcome is None:
+            summary["skippedAmbiguous"] += 1
+            continue
+        handle = str(
+            msg.get("from_handle")
+            or msg.get("from")
+            or msg.get("sender_handle")
+            or ""
+        )
+        agent_id = _resolve_agent_id_from_handle(members, handle)
+        task_id = str(msg.get("task_id") or msg.get("taskId") or "")
+        payload = msg.get("payload")
+        if not task_id and isinstance(payload, dict):
+            task_id = str(payload.get("task_id") or payload.get("taskId") or "")
+        meta = pending.get(task_id) if task_id else None
+        difficulty = None
+        risk = None
+        if isinstance(meta, dict):
+            difficulty = str(meta.get("difficulty") or "") or None
+            risk = str(meta.get("risk") or "") or None
+            if not agent_id:
+                agent_id = str(meta.get("agentId") or "") or None
+        if not agent_id:
+            # Last-resort: member whose lastTaskId matches
+            if task_id:
+                for m in members:
+                    if str(m.get("lastTaskId") or "") == task_id:
+                        agent_id = str(m.get("agentId") or "") or None
+                        lr = m.get("lastRouteReason") or {}
+                        if isinstance(lr, dict):
+                            difficulty = difficulty or lr.get("difficulty")
+                            risk = risk or lr.get("risk")
+                        break
+        if not agent_id:
+            summary["skippedNoAgent"] += 1
+            # Mark seen so unresolvable mail is not retried forever.
+            if mid:
+                rl = ensure_routing_learn(state)
+                sid = list(rl.get("seenIds") or [])
+                if mid not in sid:
+                    sid.append(mid)
+                    rl["seenIds"] = sid[-LEARNED_SEEN_ID_CAP:]
+            continue
+
+        recorded = record_route_outcome(
+            state,
+            agent_id=agent_id,
+            outcome=outcome,
+            difficulty=difficulty,
+            risk=risk,
+            task_id=task_id or None,
+            message_id=mid or None,
+        )
+        if recorded:
+            summary["ingested"] += 1
+            if task_id and task_id in pending:
+                pending.pop(task_id, None)
+        elif mid and mid in set(str(x) for x in (ensure_routing_learn(state).get("seenIds") or [])):
+            summary["skippedDuplicate"] += 1
+        else:
+            summary["skippedAmbiguous"] += 1
+    return summary
+
+
+def _laplace_rate(succeeded: int, failed: int) -> tuple[float | None, int]:
+    n = int(succeeded) + int(failed)
+    if n < LEARNED_MIN_SAMPLES:
+        return None, n
+    rate = (float(succeeded) + 1.0) / (float(succeeded) + float(failed) + 2.0)
+    return rate, n
+
+
+def learned_bias_for_agent(
+    routing_learn: dict[str, Any] | None,
+    agent_id: str,
+    *,
+    difficulty: str,
+    risk: str,
+) -> tuple[float, str | None]:
+    """
+    Return (bias_points, reason_or_None). Positive bias = historically reliable
+    for this difficulty (or overall). Caps at ±LEARNED_MAX_BIAS.
+    """
+    if not routing_learn:
+        return 0.0, None
+    agents = routing_learn.get("agents") or {}
+    st = agents.get(agent_id)
+    if not isinstance(st, dict):
+        return 0.0, None
+
+    by_d = (st.get("byDifficulty") or {}).get(difficulty) or {}
+    rate, n = _laplace_rate(int(by_d.get("succeeded") or 0), int(by_d.get("failed") or 0))
+    scope = difficulty
+    weight = LEARNED_MAX_BIAS
+    if rate is None:
+        # Fall back to overall agent rate with slightly weaker weight.
+        rate, n = _laplace_rate(int(st.get("succeeded") or 0), int(st.get("failed") or 0))
+        scope = "overall"
+        weight = LEARNED_MAX_BIAS * 0.65
+    if rate is None:
+        # Optional weak risk bucket signal.
+        by_r = (st.get("byRisk") or {}).get(risk) or {}
+        rate, n = _laplace_rate(int(by_r.get("succeeded") or 0), int(by_r.get("failed") or 0))
+        scope = f"risk:{risk}"
+        weight = LEARNED_MAX_BIAS * 0.5
+    if rate is None:
+        return 0.0, None
+
+    # rate 1→+weight, 0.5→0, 0→-weight
+    bias = (rate - 0.5) * 2.0 * weight
+    bias = max(-LEARNED_MAX_BIAS, min(LEARNED_MAX_BIAS, bias))
+    if abs(bias) < 0.5:
+        return 0.0, None
+    return round(bias, 2), f"learned:{scope}={rate:.2f}n={n}{bias:+.1f}"
+
+
+def format_routing_learn_summary(state: dict[str, Any]) -> list[str]:
+    rl = state.get("routingLearn") or {}
+    agents = rl.get("agents") if isinstance(rl, dict) else None
+    if not isinstance(agents, dict) or not agents:
+        return ["(no learned outcomes yet — need explicit worker_done --outcome)"]
+    lines: list[str] = []
+    for aid in sorted(agents.keys()):
+        st = agents.get(aid) or {}
+        if not isinstance(st, dict):
+            continue
+        s = int(st.get("succeeded") or 0)
+        f = int(st.get("failed") or 0)
+        if s + f == 0:
+            continue
+        parts = [f"{aid}: {s}ok/{f}fail"]
+        by_d = st.get("byDifficulty") or {}
+        for d in ("easy", "medium", "hard"):
+            b = by_d.get(d) or {}
+            ds, df = int(b.get("succeeded") or 0), int(b.get("failed") or 0)
+            if ds + df:
+                parts.append(f"{d}={ds}/{df}")
+        lines.append("  " + " ".join(parts))
+    return lines or ["(no learned outcomes yet)"]
+
+
+def rank_workers_for_task(
+    members: list[dict[str, Any]],
+    *,
+    spec: str,
+    difficulty: str,
+    risk: str,
+    usage_by_id: dict[str, dict[str, Any]] | None = None,
+    min_remaining: float = DEFAULT_MIN_REMAINING_PERCENT,
+    ignore_quota: bool = False,
+    live_handles: set[str] | None = None,
+    exclude_agent_ids: set[str] | None = None,
+    routing_learn: dict[str, Any] | None = None,
+    use_learned: bool = True,
+) -> list[dict[str, Any]]:
+    """Rank roster workers for a task (highest score first). Omits ineligible."""
+    usage_by_id = usage_by_id or {}
+    live_handles = live_handles or set()
+    exclude_agent_ids = {a for a in (exclude_agent_ids or set())}
+    blob = _spec_blob(spec)
+    claude_affinity = bool(_hint_hit(blob, _CLAUDE_AFFINITY_HINTS))
+    ranked: list[dict[str, Any]] = []
+
+    for member in members:
+        if member.get("role") != "worker":
+            continue
+        agent_id = str(member.get("agentId") or "").strip()
+        if not agent_id or agent_id in exclude_agent_ids:
+            continue
+
+        usage = usage_by_id.get(agent_id) or {}
+        low_quota = agent_below_quota(usage, min_remaining=min_remaining)
+        if not ignore_quota and (
+            low_quota or member.get("deferredReason") == "quota_low"
+        ):
+            continue
+
+        reasons: list[str] = []
+        score = _base_affinity(agent_id, difficulty)
+        reasons.append(f"base:{difficulty}={score:.0f}")
+
+        if risk == "high":
+            if is_claude_agent(agent_id):
+                score += 18.0
+                reasons.append("high-risk:+claude")
+            elif agent_id in {"grok", "codex"}:
+                score += 12.0
+                reasons.append("high-risk:+capable")
+            elif agent_id == "pi":
+                score -= 8.0
+                reasons.append("high-risk:pi-slight-penalty")
+
+        if claude_affinity and is_claude_agent(agent_id):
+            score += 55.0
+            reasons.append("claude-skill-affinity")
+        elif claude_affinity and not is_claude_agent(agent_id):
+            score -= 12.0
+            reasons.append("non-claude-vs-skill-hint")
+
+        if is_claude_agent(agent_id) and not claude_affinity and risk != "high":
+            score -= 25.0
+            reasons.append("claude-pool-sparing")
+
+        assign_count = int(member.get("assignCount") or 0)
+        if assign_count:
+            score -= float(assign_count) * 5.0
+            reasons.append(f"assignCount:{assign_count}")
+
+        handle = member.get("handle")
+        deferred = bool(member.get("deferred") or not handle)
+        if deferred:
+            score -= 6.0
+            reasons.append("needs-spawn")
+            if agent_id in DEFERRED_AGENTS:
+                score -= 4.0
+                reasons.append("deferred-agent-policy")
+        elif handle and str(handle) in live_handles:
+            score += 8.0
+            reasons.append("live-pane")
+        elif handle and live_handles and str(handle) not in live_handles:
+            score -= 4.0
+            reasons.append("stale-handle")
+
+        if low_quota and ignore_quota:
+            score -= 15.0
+            reasons.append("LOW-quota-overridden")
+
+        if use_learned:
+            bias, bias_reason = learned_bias_for_agent(
+                routing_learn, agent_id, difficulty=difficulty, risk=risk
+            )
+            if bias_reason:
+                score += bias
+                reasons.append(bias_reason)
+
+        ranked.append(
+            {
+                "agentId": agent_id,
+                "eligible": True,
+                "score": round(score, 2),
+                "reasons": reasons,
+                "assignCount": assign_count,
+                "deferred": deferred,
+                "handle": handle,
+                "remainingPercent": usage.get("remainingPercent"),
+            }
+        )
+
+    ranked.sort(key=lambda r: (-float(r["score"]), str(r["agentId"])))
+    return ranked
+
+
+def blocked_workers_from_rank(
+    members: list[dict[str, Any]],
+    *,
+    usage_by_id: dict[str, dict[str, Any]],
+    min_remaining: float,
+    ignore_quota: bool,
+    exclude_agent_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """List workers skipped by rank_workers_for_task (quota / exclude)."""
+    exclude_agent_ids = exclude_agent_ids or set()
+    out: list[dict[str, Any]] = []
+    for member in members:
+        if member.get("role") != "worker":
+            continue
+        agent_id = str(member.get("agentId") or "").strip()
+        if not agent_id:
+            continue
+        if agent_id in exclude_agent_ids:
+            out.append({"agentId": agent_id, "reasons": ["excluded"]})
+            continue
+        usage = usage_by_id.get(agent_id) or {}
+        if not ignore_quota and (
+            agent_below_quota(usage, min_remaining=min_remaining)
+            or member.get("deferredReason") == "quota_low"
+        ):
+            rem = usage.get("remainingPercent")
+            out.append(
+                {
+                    "agentId": agent_id,
+                    "reasons": [
+                        f"LOW quota ({rem}% < {min_remaining:.0f}%)"
+                        if rem is not None
+                        else "LOW quota"
+                    ],
+                    "remainingPercent": rem,
+                }
+            )
+    return out
+
+
+def pick_worker_for_task(
+    state: dict[str, Any],
+    *,
+    spec: str,
+    difficulty: str | None = None,
+    risk: str | None = None,
+    min_remaining: float = DEFAULT_MIN_REMAINING_PERCENT,
+    ignore_quota: bool = False,
+    live_handles: set[str] | None = None,
+    exclude_agent_ids: set[str] | None = None,
+    usage_rows: list[dict[str, Any]] | None = None,
+    use_learned: bool = True,
+) -> dict[str, Any]:
+    """Score roster; return difficulty/risk/pick/ranked/blocked. Raises if none eligible."""
+    members = list(state.get("members") or [])
+    diff = infer_difficulty(spec, explicit=difficulty)
+    rsk = infer_risk(spec, explicit=risk)
+    worker_ids = [
+        str(m.get("agentId"))
+        for m in members
+        if m.get("role") == "worker" and m.get("agentId")
+    ]
+    if usage_rows is None:
+        usage_rows = usage_report(worker_ids) if worker_ids else []
+    usage_by_id = {str(r.get("agentId")): r for r in usage_rows}
+    ranked = rank_workers_for_task(
+        members,
+        spec=spec,
+        difficulty=diff,
+        risk=rsk,
+        usage_by_id=usage_by_id,
+        min_remaining=min_remaining,
+        ignore_quota=ignore_quota,
+        live_handles=live_handles,
+        exclude_agent_ids=exclude_agent_ids,
+        routing_learn=state.get("routingLearn") if isinstance(state.get("routingLearn"), dict) else None,
+        use_learned=use_learned,
+    )
+    blocked = blocked_workers_from_rank(
+        members,
+        usage_by_id=usage_by_id,
+        min_remaining=min_remaining,
+        ignore_quota=ignore_quota,
+        exclude_agent_ids=exclude_agent_ids,
+    )
+    if not ranked:
+        detail = ", ".join(
+            f"{b['agentId']}({'; '.join(b.get('reasons') or [])})" for b in blocked
+        ) or "(no workers on roster)"
+        raise TeamError(
+            f"no eligible worker for difficulty={diff} risk={rsk}. Blocked: {detail}. "
+            f"Try --ignore-quota or open healthier workers."
+        )
+    learn_lines = format_routing_learn_summary(state)
+    return {
+        "difficulty": diff,
+        "risk": rsk,
+        "claudeAffinity": bool(_hint_hit(_spec_blob(spec), _CLAUDE_AFFINITY_HINTS)),
+        "pick": ranked[0],
+        "ranked": ranked,
+        "blocked": blocked,
+        "cheatsheet": ROUTING_CHEATSHEET,
+        "minRemainingPercent": min_remaining,
+        "ignoreQuota": ignore_quota,
+        "useLearned": use_learned,
+        "learned": learn_lines,
+    }
+
+
+def ensure_worker_quota(
+    member: dict[str, Any],
+    *,
+    min_remaining: float,
+    ignore_quota: bool,
+) -> dict[str, Any]:
+    """Probe usage for one worker; raise if LOW unless ignore_quota."""
+    agent_id = str(member.get("agentId") or "")
+    row = probe_agent_usage(agent_id)
+    if ignore_quota:
+        return row
+    if member.get("deferredReason") == "quota_low" or agent_below_quota(
+        row, min_remaining=min_remaining
+    ):
+        rem = row.get("remainingPercent")
+        rem_s = f"{float(rem):.0f}%" if rem is not None else "unknown"
+        raise TeamError(
+            f"worker {agent_id} is below quota ({rem_s} remaining < {min_remaining:.0f}%). "
+            f"Pick another worker, run `orca-team route --spec …`, or pass --ignore-quota."
+        )
+    return row
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    """Rank roster workers for a task without dispatching."""
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state or state.get("status") != "running":
+        raise TeamError("no running ai-team; start a team first")
+
+    orch = next((m for m in state.get("members") or [] if m.get("role") == "orchestrator"), None)
+    orch_handle = str((orch or {}).get("handle") or "")
+    ingest = ingest_worker_done_outcomes(orca, state, orch_handle=orch_handle)
+    if ingest.get("ingested"):
+        save_state(worktree_path, state)
+
+    spec = (args.spec or "").strip()
+    if not spec:
+        raise TeamError("--spec required")
+    exclude: set[str] = set()
+    esc = (getattr(args, "exclude", "") or "").strip()
+    if esc:
+        for part in esc.split(","):
+            p = part.strip()
+            if p:
+                exclude.add(p)
+    live_handles = list_live_handles(orca, worktree_path)
+    use_learned = not bool(getattr(args, "no_learned", False))
+    result = pick_worker_for_task(
+        state,
+        spec=spec,
+        difficulty=getattr(args, "difficulty", None) or None,
+        risk=getattr(args, "risk", None) or None,
+        min_remaining=float(
+            getattr(args, "min_remaining", DEFAULT_MIN_REMAINING_PERCENT)
+        ),
+        ignore_quota=bool(getattr(args, "ignore_quota", False)),
+        live_handles=live_handles,
+        exclude_agent_ids=exclude or None,
+        use_learned=use_learned,
+    )
+    result["ingest"] = ingest
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0
+
+    pick = result["pick"]
+    print(
+        f"route → {pick['agentId']}  "
+        f"(difficulty={result['difficulty']} risk={result['risk']} "
+        f"score={pick['score']})"
+    )
+    print(f"  reasons: {', '.join(pick.get('reasons') or [])}")
+    print("  ranked:")
+    for i, row in enumerate(result["ranked"], 1):
+        rem = row.get("remainingPercent")
+        rem_s = f" {float(rem):.0f}%left" if rem is not None else ""
+        print(
+            f"    {i}. {row['agentId']} score={row['score']}{rem_s} "
+            f"assigns={row.get('assignCount', 0)} "
+            f"[{', '.join(row.get('reasons') or [])}]"
+        )
+    if result["blocked"]:
+        print("  blocked:")
+        for b in result["blocked"]:
+            print(f"    - {b['agentId']}: {', '.join(b.get('reasons') or [])}")
+    if ingest.get("ingested") or ingest.get("scanned"):
+        print(
+            f"  learn-ingest: scanned={ingest.get('scanned', 0)} "
+            f"ingested={ingest.get('ingested', 0)} "
+            f"ambiguous={ingest.get('skippedAmbiguous', 0)}"
+        )
+    print("  learned:")
+    for line in result.get("learned") or []:
+        print(f"    {line}" if not line.startswith("  ") else f"  {line}")
+    print(f"  tip: orca-team assign --spec {spec!r}   # omit --worker to use this pick")
+    return 0
+
+
+def cmd_learn(args: argparse.Namespace) -> int:
+    """Ingest explicit worker_done outcomes into routingLearn (or reset/show)."""
+    orca = resolve_orca()
+    cwd = Path.cwd()
+    wt = find_worktree(orca, cwd)
+    worktree_path = Path(wt["path"]).resolve()
+    state = load_state(worktree_path)
+    if not state:
+        raise TeamError("no ai-team state; start a team first")
+
+    if bool(getattr(args, "reset", False)):
+        state["routingLearn"] = {"version": 1, "seenIds": [], "agents": {}}
+        state["pendingRoutes"] = {}
+        save_state(worktree_path, state)
+        msg = {"ok": True, "reset": True, "path": str(state_path_for(worktree_path))}
+        if getattr(args, "json", False):
+            print(json.dumps(msg, indent=2))
+        else:
+            print("routing learn reset (outcomes + pending routes cleared)")
+        return 0
+
+    orch = next((m for m in state.get("members") or [] if m.get("role") == "orchestrator"), None)
+    orch_handle = str((orch or {}).get("handle") or "")
+    ingest = {"scanned": 0, "ingested": 0}
+    if not bool(getattr(args, "show", False)):
+        ingest = ingest_worker_done_outcomes(
+            orca,
+            state,
+            orch_handle=orch_handle,
+            limit=int(getattr(args, "limit", 50) or 50),
+        )
+        save_state(worktree_path, state)
+
+    payload = {
+        "ok": True,
+        "ingest": ingest,
+        "learned": format_routing_learn_summary(state),
+        "routingLearn": state.get("routingLearn"),
+        "pendingRoutes": state.get("pendingRoutes") or {},
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2))
+        return 0
+    if not bool(getattr(args, "show", False)):
+        print(
+            f"learn: scanned={ingest.get('scanned', 0)} "
+            f"ingested={ingest.get('ingested', 0)} "
+            f"ambiguous={ingest.get('skippedAmbiguous', 0)} "
+            f"dup={ingest.get('skippedDuplicate', 0)} "
+            f"noAgent={ingest.get('skippedNoAgent', 0)}"
+        )
+    print("learned outcomes:")
+    for line in payload["learned"]:
+        print(line if line.startswith("  ") or line.startswith("(") else f"  {line}")
+    pending = payload["pendingRoutes"]
+    if pending:
+        print(f"pending routes: {len(pending)}")
+        for tid, meta in list(pending.items())[:8]:
+            print(
+                f"  - {tid}: {meta.get('agentId')} "
+                f"{meta.get('difficulty')}/{meta.get('risk')}"
+            )
+    return 0
+
+
 def cmd_assign(args: argparse.Namespace) -> int:
     """Lean-assign a task to a roster worker (send-once role + short card)."""
     orca = resolve_orca()
@@ -2812,12 +3749,59 @@ def cmd_assign(args: argparse.Namespace) -> int:
     if not orch or not orch.get("handle"):
         raise TeamError("team state missing orchestrator handle")
     orch_handle = str(orch["handle"])
-    member = resolve_worker_member(state, args.worker)
-    agent_id = str(member.get("agentId") or "worker")
     live_handles = list_live_handles(orca, worktree_path)
     dry_run = bool(args.dry_run)
     force_role = bool(args.force_role)
     as_json = bool(args.json)
+    ignore_quota = bool(getattr(args, "ignore_quota", False))
+    min_remaining = float(
+        getattr(args, "min_remaining", DEFAULT_MIN_REMAINING_PERCENT)
+    )
+    use_learned = not bool(getattr(args, "no_learned", False))
+    ingest = ingest_worker_done_outcomes(orca, state, orch_handle=orch_handle)
+    if ingest.get("ingested"):
+        save_state(worktree_path, state)
+    route_meta: dict[str, Any] | None = None
+    worker_ref = (getattr(args, "worker", None) or "").strip()
+    exclude: set[str] = set()
+    esc = (getattr(args, "exclude", "") or "").strip()
+    if esc:
+        for part in esc.split(","):
+            p = part.strip()
+            if p:
+                exclude.add(p)
+    spec_early = (args.spec or "").strip()
+    if not worker_ref:
+        if not spec_early and not (args.task_id or "").strip():
+            raise TeamError(
+                "--worker omitted: provide --spec so route can pick a worker "
+                "(or pass --worker explicitly)"
+            )
+        route_meta = pick_worker_for_task(
+            state,
+            spec=spec_early or f"continue task {args.task_id}",
+            difficulty=getattr(args, "difficulty", None) or None,
+            risk=getattr(args, "risk", None) or None,
+            min_remaining=min_remaining,
+            ignore_quota=ignore_quota,
+            live_handles=live_handles,
+            exclude_agent_ids=exclude or None,
+            use_learned=use_learned,
+        )
+        worker_ref = str(route_meta["pick"]["agentId"])
+        print(
+            f"  auto-route → {worker_ref} "
+            f"(difficulty={route_meta['difficulty']} risk={route_meta['risk']} "
+            f"score={route_meta['pick']['score']})",
+            flush=True,
+        )
+    member = resolve_worker_member(state, worker_ref)
+    agent_id = str(member.get("agentId") or "worker")
+    if exclude and agent_id in exclude:
+        raise TeamError(f"worker {agent_id} is excluded via --exclude")
+    ensure_worker_quota(
+        member, min_remaining=min_remaining, ignore_quota=ignore_quota
+    )
 
     # Fresh spawn when deferred / no live handle.
     handle = member.get("handle")
@@ -3068,6 +4052,39 @@ def cmd_assign(args: argparse.Namespace) -> int:
     member["lastAssignAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     member["lastAssignMode"] = planned["mode"]
     member["lastTaskId"] = task_id
+    member["assignCount"] = int(member.get("assignCount") or 0) + 1
+    # Always tag difficulty/risk for learned routing (even with explicit --worker).
+    diff_tag = (
+        (route_meta or {}).get("difficulty")
+        or getattr(args, "difficulty", None)
+        or infer_difficulty(spec or "", explicit=None)
+    )
+    risk_tag = (
+        (route_meta or {}).get("risk")
+        or getattr(args, "risk", None)
+        or infer_risk(spec or "", explicit=None)
+    )
+    if route_meta:
+        member["lastRouteReason"] = {
+            "difficulty": route_meta.get("difficulty"),
+            "risk": route_meta.get("risk"),
+            "score": (route_meta.get("pick") or {}).get("score"),
+            "reasons": (route_meta.get("pick") or {}).get("reasons"),
+        }
+    else:
+        member["lastRouteReason"] = {
+            "difficulty": diff_tag,
+            "risk": risk_tag,
+            "score": None,
+            "reasons": ["explicit-worker"],
+        }
+    remember_pending_route(
+        state,
+        task_id=str(task_id),
+        agent_id=agent_id,
+        difficulty=str(diff_tag),
+        risk=str(risk_tag),
+    )
     save_state(worktree_path, state)
 
     result = {
@@ -3079,7 +4096,14 @@ def cmd_assign(args: argparse.Namespace) -> int:
         "dispatchId": dispatch_id,
         "mode": planned["mode"],
         "marker": LEAN_ASSIGN_MARKER,
+        "assignCount": member.get("assignCount"),
     }
+    if route_meta:
+        result["route"] = {
+            "difficulty": route_meta.get("difficulty"),
+            "risk": route_meta.get("risk"),
+            "pick": route_meta.get("pick"),
+        }
     if as_json:
         print(json.dumps(result, indent=2))
     else:
@@ -3411,6 +4435,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("  watch:     off")
     else:
         print("  watch:     (none)")
+    print("  learned:")
+    for line in format_routing_learn_summary(state):
+        print(f"    {line}" if not str(line).startswith("  ") else f"  {line}")
+    pending_n = len(state.get("pendingRoutes") or {})
+    if pending_n:
+        print(f"  pendingRoutes: {pending_n}")
     print("  members:")
     live = orca_json(
         orca,
@@ -3440,6 +4470,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             mode = member.get("lastAssignMode")
             if mode:
                 role_note += f" lastAssign={mode}"
+            ac = member.get("assignCount")
+            if ac:
+                role_note += f" assigns={ac}"
         print(
             f"    - {member.get('role')}:{member.get('agentId')} "
             f"handle={handle} [{presence}]{role_note}"
@@ -3808,6 +4841,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
         if not team_still_running(worktree_path, run_id):
             print(f"[{utc_now()}] watching stopped — team ended or run changed", flush=True)
             return 0
+        # Refresh state + learn from explicit worker_done outcomes.
+        state = load_state(worktree_path) or state
+        ingest = ingest_worker_done_outcomes(orca, state, orch_handle=orch_handle)
+        if ingest.get("ingested"):
+            save_state(worktree_path, state)
+            print(
+                f"[{utc_now()}] learn ingested={ingest['ingested']} "
+                f"scanned={ingest.get('scanned', 0)}",
+                flush=True,
+            )
         now = datetime.now(timezone.utc)
         tasks = list_dispatched_tasks(orca, run_id=run_id, orch_handle=orch_handle)
         stale_rows: list[dict[str, Any]] = []
@@ -4171,13 +5214,14 @@ def build_parser() -> argparse.ArgumentParser:
         "assign",
         help=(
             "Lean-assign a task to a roster worker: role once per fresh pane, "
-            "then short task card (no fat dispatch --inject)"
+            "then short task card (no fat dispatch --inject). "
+            "Omit --worker to auto-route via the same scorer as `route`."
         ),
     )
     assign.add_argument(
         "--worker",
-        required=True,
-        help="Worker agent id or terminal handle from the team roster",
+        default="",
+        help="Worker agent id or handle (optional: omit to auto-route from --spec)",
     )
     assign.add_argument(
         "--spec",
@@ -4188,6 +5232,39 @@ def build_parser() -> argparse.ArgumentParser:
     assign.add_argument("--in-scope", default="", help="In-scope paths (card field)")
     assign.add_argument("--out-scope", default="", help="Out-of-scope paths (card field)")
     assign.add_argument("--done", default="", help="Done criteria (card field)")
+    assign.add_argument(
+        "--difficulty",
+        default=None,
+        choices=["easy", "medium", "hard"],
+        help="Override inferred difficulty for auto-route",
+    )
+    assign.add_argument(
+        "--risk",
+        default=None,
+        choices=["low", "high"],
+        help="Override inferred risk for auto-route",
+    )
+    assign.add_argument(
+        "--exclude",
+        default="",
+        help="Comma-separated agent ids to skip (cascade/escalate)",
+    )
+    assign.add_argument(
+        "--min-remaining",
+        type=float,
+        default=DEFAULT_MIN_REMAINING_PERCENT,
+        help=f"Refuse workers below this remaining %% (default: {DEFAULT_MIN_REMAINING_PERCENT})",
+    )
+    assign.add_argument(
+        "--ignore-quota",
+        action="store_true",
+        help="Allow assign even when worker usage is LOW",
+    )
+    assign.add_argument(
+        "--no-learned",
+        action="store_true",
+        help="Ignore routingLearn outcome bias when auto-routing",
+    )
     assign.add_argument(
         "--force-role",
         action="store_true",
@@ -4200,6 +5277,70 @@ def build_parser() -> argparse.ArgumentParser:
     )
     assign.add_argument("--json", action="store_true", help="Emit JSON")
     assign.set_defaults(func=cmd_assign)
+
+    route_cmd = sub.add_parser(
+        "route",
+        help="Rank roster workers for a task (difficulty/risk/quota) without dispatching",
+    )
+    route_cmd.add_argument("--spec", required=True, help="Task goal/spec text to classify")
+    route_cmd.add_argument(
+        "--difficulty",
+        default=None,
+        choices=["easy", "medium", "hard"],
+        help="Override inferred difficulty",
+    )
+    route_cmd.add_argument(
+        "--risk",
+        default=None,
+        choices=["low", "high"],
+        help="Override inferred risk",
+    )
+    route_cmd.add_argument(
+        "--exclude",
+        default="",
+        help="Comma-separated agent ids to skip (e.g. prior failed worker)",
+    )
+    route_cmd.add_argument(
+        "--min-remaining",
+        type=float,
+        default=DEFAULT_MIN_REMAINING_PERCENT,
+        help=f"Treat below this remaining %% as blocked (default: {DEFAULT_MIN_REMAINING_PERCENT})",
+    )
+    route_cmd.add_argument(
+        "--ignore-quota",
+        action="store_true",
+        help="Include LOW-quota workers in ranking",
+    )
+    route_cmd.add_argument(
+        "--no-learned",
+        action="store_true",
+        help="Ignore routingLearn outcome bias for this ranking",
+    )
+    route_cmd.add_argument("--json", action="store_true", help="Emit JSON")
+    route_cmd.set_defaults(func=cmd_route)
+
+    learn_cmd = sub.add_parser(
+        "learn",
+        help="Ingest explicit worker_done outcomes into routingLearn (or show/reset)",
+    )
+    learn_cmd.add_argument(
+        "--show",
+        action="store_true",
+        help="Show stored stats without scanning inbox",
+    )
+    learn_cmd.add_argument(
+        "--reset",
+        action="store_true",
+        help="Clear routingLearn + pendingRoutes",
+    )
+    learn_cmd.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Inbox messages to scan (default 50)",
+    )
+    learn_cmd.add_argument("--json", action="store_true", help="Emit JSON")
+    learn_cmd.set_defaults(func=cmd_learn)
 
     usage_cmd = sub.add_parser(
         "usage",
