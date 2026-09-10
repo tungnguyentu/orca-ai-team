@@ -140,10 +140,20 @@ Same roles as `hello-orca`, files under `plugin/`:
 
 ### Install
 
-1. Orca → **Plugins** (experimental).
-2. Add from Git `https://github.com/tungnguyentu/orca-ai-team` or from folder — use **v0.3.4+**.
-3. Consent to terminal send / notifications / storage / events.
-4. `orca terminal list --json` → paste id in **AI Team** panel → Start (later shortcut reuses stored id).
+**Important:** the latest *tag* must be **v0.3.4+**. Older tag `v0.3.0` still declares `workspace:read` and will fail third-party install. Prefer ref `v0.3.4` or branch `main` (not an old tag).
+
+**As a marketplace** (matches the “Add Marketplace” dialog):
+
+1. Orca → **Plugins** → Add Marketplace  
+2. URL: `https://github.com/tungnguyentu/orca-ai-team` (repo root has `orca-marketplace.json` pinning `ref: v0.3.4`)  
+3. Install the listed **tungnguyentu.orca-ai-team** plugin and consent to terminal send / notifications / storage / events  
+
+**As a single plugin (folder / git):**
+
+1. Install from folder (this checkout) **or** git with ref `main` / `v0.3.4`  
+2. Same consent list  
+
+Then: `orca terminal list --json` → paste id in **AI Team** panel → Start (shortcut reuses stored id).
 
 ---
 
