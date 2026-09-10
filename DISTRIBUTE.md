@@ -78,6 +78,8 @@ Separate system for **app UI contributions**:
 | Language packs | |
 | VM recipes | |
 
+`name` must be **lowercase alphanumeric with hyphens only** (e.g. `orca-ai-team`). Display titles belong on panels/commands, not in `name`.
+
 Example shape (bundled plugins under `/usr/lib/orca-ide/plugins/launch/*/orca-plugin.json`):
 
 ```json
@@ -85,8 +87,9 @@ Example shape (bundled plugins under `/usr/lib/orca-ide/plugins/launch/*/orca-pl
   "manifestVersion": 1,
   "id": "orca-ai-team",
   "publisher": "your-publisher",
-  "name": "Orca AI Team",
+  "name": "orca-ai-team",
   "version": "1.0.0",
+
   "description": "...",
   "repository": "https://github.com/tungnguyentu/orca-ai-team",
   "engines": { "orca": ">=1.4.0" },
