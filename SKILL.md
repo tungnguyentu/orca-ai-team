@@ -1,6 +1,6 @@
 ---
 name: orca-ai-team
-version: 0.3.3
+version: 0.3.4
 
 description: >-
   Open a multi-agent Orca team room in one worktree: one orchestrator plus

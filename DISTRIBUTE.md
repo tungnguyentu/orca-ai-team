@@ -80,6 +80,8 @@ Separate system for **app UI contributions**:
 
 `name` must be **lowercase alphanumeric with hyphens only** (e.g. `orca-ai-team`). Display titles belong on panels/commands, not in `name`.
 
+Third-party (Git/folder) installs **cannot** declare `workspace:read` — Orca rejects the plugin. This repo’s plugin therefore asks for a terminal id in the panel (from `orca terminal list --json`) and only requests `terminal:send`, `notifications:show`, `storage`, and `events:subscribe`.
+
 Example shape (bundled plugins under `/usr/lib/orca-ide/plugins/launch/*/orca-plugin.json`):
 
 ```json
@@ -117,9 +119,9 @@ What it can do (Orca plugin host API v0):
 
 - Command palette: **AI Team: Start (same-tab)** / **… (tabs layout)**
 - Shortcut: `Mod+Alt+A` (worktree context)
-- Panel: pick terminal + optional objective → send start command
+- Panel: paste terminal id + optional objective → send start command
 
-What it **cannot** do yet: create a new terminal by itself (host API only has `terminal.sendText`). User must have a shell tab open in the focused worktree. Also requires `orca-team` on PATH (install the skill first).
+What it **cannot** do yet: list worktree terminals automatically (third-party plugins cannot use `workspace:read`), or create a new terminal by itself (host API only has `terminal.sendText`). Paste an id from `orca terminal list --json`. Also requires `orca-team` on PATH (install the skill first).
 
 ### Install the plugin in Orca
 
@@ -127,7 +129,7 @@ Orca’s plugin system is still experimental. Typical paths:
 
 1. Open **Plugins** in the Orca app.
 2. Install from Git source: `https://github.com/tungnguyentu/orca-ai-team` (needs access if private), **or** install from a local folder / marketplace listing when available.
-3. Consent to capabilities: workspace read, terminal send, notifications.
+3. Consent to capabilities: terminal send, notifications, storage, events (no `workspace:read` — blocked for third-party).
 
 Sideload for local testing (paths vary by Orca version): copy/link this repo under Orca’s user plugins directory if the UI offers “Install from folder”, or use the Plugins catalog “from Git” flow.
 

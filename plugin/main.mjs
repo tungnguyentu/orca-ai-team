@@ -1,6 +1,10 @@
 // Orca AI Team plugin worker (plain Node, no Electron).
 // Activated on first command/event. Types `orca-team start ...` into a
-// focused worktree terminal via the capability-gated host API.
+// worktree terminal via the capability-gated host API.
+//
+// Note: third-party plugins cannot declare `workspace:read`, so this worker
+// does not call workspace.readContext. Pass terminalId (panel) or reuse the
+// last successful terminal from plugin storage.
 
 function buildStartCommand({ sameTab = false, objective = '' } = {}) {
   // Default CLI layout is dual (orch tab + workers tab). Only pass --same-tab when asked.
@@ -15,22 +19,32 @@ function buildStartCommand({ sameTab = false, objective = '' } = {}) {
   return parts.join(' ')
 }
 
-async function pickTerminalId(orca, preferredId) {
-  const ctx = await orca.host.call('workspace.readContext', {})
-  if (!ctx) {
-    return { error: 'No focused worktree. Open a worktree first.' }
-  }
-  const terminals = Array.isArray(ctx.terminals) ? ctx.terminals : []
-  if (terminals.length === 0) {
-    return {
-      error: `Worktree "${ctx.displayName}" has no terminals. Open a shell tab, then retry.`,
-      context: ctx
+async function loadLastTerminalId(orca) {
+  try {
+    const got = await orca.host.call('storage.get', { key: 'lastStart' })
+    const value = got?.value
+    if (value && typeof value === 'object' && typeof value.terminalId === 'string') {
+      const id = value.terminalId.trim()
+      if (id) return id
     }
+  } catch {
+    // storage miss / denied — fall through
   }
-  if (preferredId && terminals.some((t) => t.id === preferredId)) {
-    return { terminalId: preferredId, context: ctx }
+  return null
+}
+
+async function resolveTerminalId(orca, preferredId) {
+  if (preferredId && String(preferredId).trim()) {
+    return { terminalId: String(preferredId).trim(), source: 'arg' }
   }
-  return { terminalId: terminals[0].id, context: ctx }
+  const last = await loadLastTerminalId(orca)
+  if (last) {
+    return { terminalId: last, source: 'storage' }
+  }
+  return {
+    error:
+      'No terminal id. Open the AI Team panel, paste a terminal id from `orca terminal list --json`, then Start. Or pass terminalId to the command.'
+  }
 }
 
 async function startAiTeam(orca, args = {}) {
@@ -39,7 +53,7 @@ async function startAiTeam(orca, args = {}) {
   const preferredTerminalId =
     typeof args?.terminalId === 'string' ? args.terminalId : undefined
 
-  const picked = await pickTerminalId(orca, preferredTerminalId)
+  const picked = await resolveTerminalId(orca, preferredTerminalId)
   if (picked.error) {
     await orca.host.call('notifications.show', {
       title: 'AI Team',
@@ -64,21 +78,23 @@ async function startAiTeam(orca, args = {}) {
     body
   })
 
-  await orca.host.call('storage.set', {
-    key: 'lastStart',
-    value: {
-      at: Date.now(),
-      terminalId: picked.terminalId,
-      command,
-      worktree: picked.context?.displayName ?? null
-    }
-  })
+  if (send?.accepted) {
+    await orca.host.call('storage.set', {
+      key: 'lastStart',
+      value: {
+        at: Date.now(),
+        terminalId: picked.terminalId,
+        command,
+        source: picked.source
+      }
+    })
+  }
 
   return {
     ok: Boolean(send?.accepted),
     terminalId: picked.terminalId,
     command,
-    worktree: picked.context?.displayName ?? null
+    source: picked.source
   }
 }
 
