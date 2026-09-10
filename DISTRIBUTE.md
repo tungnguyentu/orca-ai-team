@@ -138,6 +138,10 @@ Same roles as `hello-orca`, files under `plugin/`:
 **Can:** palette commands, `Mod+Alt+A`, panel Start.  
 **Cannot (third-party):** auto-list terminals, create terminals. Needs `orca-team` on PATH.
 
+### Troubleshooting
+
+If Orca only says “Plugin installation failed” after fetching this repository, check the manifest `id`. Orca reserves IDs beginning with `orca-` for official plugins, so the former `orca-ai-team` ID was rejected for this third-party source. Version `v0.3.5` fixes this with the unreserved `ai-team` ID.
+
 ### Install
 
 **Important:** use **v0.3.5+**. Earlier versions used the reserved `orca-ai-team` plugin id and Orca rejects that identity for third-party sources. Prefer ref `v0.3.5` or branch `main`.
