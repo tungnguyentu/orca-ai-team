@@ -98,7 +98,7 @@ Host methods used by samples (capability-gated):
 
 Orca treats this repo as **third-party / untrusted**. Observed install gates:
 
-1. **`name` must be kebab-case** (`orca-ai-team`), not `Orca AI Team`. Human labels go on panel/command `title`s.
+1. **`id` must not start with `orca-`** — that prefix is reserved for official plugins. This plugin uses `ai-team`.
 2. **`workspace:read` is rejected** — *not allowed for third-party plugins*. You cannot copy `hello-orca`’s terminal picker unchanged.
 3. Keep capabilities minimal: `terminal:send`, `notifications:show`, `storage`, `events:subscribe`.
 
@@ -107,10 +107,10 @@ So this plugin’s panel **pastes a terminal id** from `orca terminal list --jso
 ```json
 {
   "manifestVersion": 1,
-  "id": "orca-ai-team",
+  "id": "ai-team",
   "publisher": "tungnguyentu",
-  "name": "orca-ai-team",
-  "version": "0.3.4",
+  "name": "Orca AI Team",
+  "version": "0.3.5",
   "engines": { "orca": ">=1.4.0" },
   "pluginApi": 1,
   "main": "plugin/main.mjs",
@@ -131,7 +131,7 @@ So this plugin’s panel **pastes a terminal id** from `orca terminal list --jso
 
 Same roles as `hello-orca`, files under `plugin/`:
 
-- `orca-plugin.json` — manifest identity `tungnguyentu.orca-ai-team`
+- `orca-plugin.json` — manifest identity `tungnguyentu.ai-team`
 - `plugin/main.mjs` — worker types `orca-team start …` via `terminal.sendText`; stores last terminal id
 - `plugin/panel.html` — paste terminal id + optional objective → send
 
@@ -140,17 +140,17 @@ Same roles as `hello-orca`, files under `plugin/`:
 
 ### Install
 
-**Important:** the latest *tag* must be **v0.3.4+**. Older tag `v0.3.0` still declares `workspace:read` and will fail third-party install. Prefer ref `v0.3.4` or branch `main` (not an old tag).
+**Important:** use **v0.3.5+**. Earlier versions used the reserved `orca-ai-team` plugin id and Orca rejects that identity for third-party sources. Prefer ref `v0.3.5` or branch `main`.
 
 **As a marketplace** (matches the “Add Marketplace” dialog):
 
 1. Orca → **Plugins** → Add Marketplace  
-2. URL: `https://github.com/tungnguyentu/orca-ai-team` (repo root has `orca-marketplace.json` pinning `ref: v0.3.4`)  
-3. Install the listed **tungnguyentu.orca-ai-team** plugin and consent to terminal send / notifications / storage / events  
+2. URL: `https://github.com/tungnguyentu/orca-ai-team` (repo root has `orca-marketplace.json` pinning `ref: v0.3.5`)
+3. Install the listed **tungnguyentu.ai-team** plugin and consent to terminal send / notifications / storage / events
 
 **As a single plugin (folder / git):**
 
-1. Install from folder (this checkout) **or** git with ref `main` / `v0.3.4`  
+1. Install from folder (this checkout) **or** git with ref `main` / `v0.3.5`
 2. Same consent list  
 
 Then: `orca terminal list --json` → paste id in **AI Team** panel → Start (shortcut reuses stored id).

@@ -3,11 +3,11 @@
   "owner": "tungnguyentu",
   "plugins": [
     {
-      "id": "tungnguyentu.orca-ai-team",
+      "id": "tungnguyentu.ai-team",
       "source": {
         "kind": "git",
         "url": "https://github.com/tungnguyentu/orca-ai-team.git",
-        "ref": "v0.3.4"
+        "ref": "v0.3.5"
       },
       "description": "Start a multi-agent team room (orchestrator + workers) via orca-team. Third-party safe: no workspace:read.",
       "categories": ["commands"]
