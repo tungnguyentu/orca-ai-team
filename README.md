@@ -12,7 +12,9 @@ Open one orchestrator plus workers (Claude Opus/Sonnet, Grok, Pi, command-code, 
 
 ### Orca desktop plugin
 
-This repo includes an experimental `orca-plugin.json` + `plugin/` panel/commands that type `orca-team start` into a worktree terminal (requires `orca-team` on PATH and an open shell tab). Install via Orca **Plugins** (from Git / folder). See `DISTRIBUTE.md`.
+Experimental `orca-plugin.json` + `plugin/` worker/panel, modeled on Orca’s upstream [`hello-orca`](https://github.com/stablyai/orca/tree/main/examples/plugins/hello-orca) example.
+
+**Third-party install constraints** (Git/folder, non-`stablyai` publisher): kebab-case `name`, and **no** `workspace:read`. The panel therefore asks for a pasted terminal id (`orca terminal list --json`) instead of auto-listing terminals. Requires `orca-team` on PATH. Details: [`DISTRIBUTE.md`](./DISTRIBUTE.md).
 
 ## Install
 

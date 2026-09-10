@@ -69,71 +69,81 @@ ln -sfn ~/.agents/skills/orca-ai-team/scripts/orca-team ~/.local/bin/orca-team
 
 ## 2. Orca desktop plugin (`orca-plugin.json`)
 
-Separate system for **app UI contributions**:
+Separate system for **app UI contributions** (experimental). Upstream references:
 
-| Can contribute today (examples) | Not the right fit for us |
-|---------------------------------|---------------------------|
-| Commands / keybindings | Packaging a CLI + agent skill |
-| Panels (HTML) | Marketplace “skills” category currently unsupported |
-| Language packs | |
-| VM recipes | |
+- Example worker+panel: [`stablyai/orca` → `examples/plugins/hello-orca`](https://github.com/stablyai/orca/tree/main/examples/plugins/hello-orca)
+- Official catalog: [`stablyai/orca-plugins`](https://github.com/stablyai/orca-plugins)
 
-`name` must be **lowercase alphanumeric with hyphens only** (e.g. `orca-ai-team`). Display titles belong on panels/commands, not in `name`.
+### How a worker + panel plugin is built (from `hello-orca`)
 
-Third-party (Git/folder) installs **cannot** declare `workspace:read` — Orca rejects the plugin. This repo’s plugin therefore asks for a terminal id in the panel (from `orca terminal list --json`) and only requests `terminal:send`, `notifications:show`, `storage`, and `events:subscribe`.
+| Piece | Role |
+|-------|------|
+| `orca-plugin.json` | Manifest: `id`, `publisher`, `name`, `version`, `engines.orca`, `pluginApi: 1`, `main`, `contributes`, `capabilities` |
+| `main.mjs` | Out-of-process Node worker. `export default function activate(orca) { … }`. Registers commands/events; calls `orca.host.call('<method>', params)` |
+| `panel.html` | Sandboxed iframe. Host bridge only via `postMessage({ type: 'orca-panel-action', action, params })` |
 
-Example shape (bundled plugins under `/usr/lib/orca-ide/plugins/launch/*/orca-plugin.json`):
+Host methods used by samples (capability-gated):
+
+| Method | Capability | Available in panel? |
+|--------|------------|---------------------|
+| `workspace.readContext` | `workspace:read` | yes |
+| `terminal.sendText` | `terminal:send` | yes |
+| `notifications.show` | `notifications:show` | yes |
+| `storage.*` | `storage` | no (worker only) |
+| event subscriptions | `events:subscribe` | via `contributes.events` + worker |
+
+`hello-orca` declares `workspace:read` and builds a terminal `<select>` from `workspace.readContext` before calling `terminal.sendText`. Many official marketplace plugins use **empty** `capabilities` (themes, keybinding `action` aliases, VM recipes) and display-case names — those are first-party/`stablyai` paths.
+
+### Third-party rules (Git/folder, publisher ≠ `stablyai`)
+
+Orca treats this repo as **third-party / untrusted**. Observed install gates:
+
+1. **`name` must be kebab-case** (`orca-ai-team`), not `Orca AI Team`. Human labels go on panel/command `title`s.
+2. **`workspace:read` is rejected** — *not allowed for third-party plugins*. You cannot copy `hello-orca`’s terminal picker unchanged.
+3. Keep capabilities minimal: `terminal:send`, `notifications:show`, `storage`, `events:subscribe`.
+
+So this plugin’s panel **pastes a terminal id** from `orca terminal list --json` instead of calling `workspace.readContext`.
 
 ```json
 {
   "manifestVersion": 1,
   "id": "orca-ai-team",
-  "publisher": "your-publisher",
+  "publisher": "tungnguyentu",
   "name": "orca-ai-team",
-  "version": "1.0.0",
-
-  "description": "...",
-  "repository": "https://github.com/tungnguyentu/orca-ai-team",
+  "version": "0.3.4",
   "engines": { "orca": ">=1.4.0" },
   "pluginApi": 1,
-  "contributes": { },
-  "capabilities": []
+  "main": "plugin/main.mjs",
+  "capabilities": [
+    { "kind": "terminal:send" },
+    { "kind": "notifications:show" },
+    { "kind": "storage" },
+    { "kind": "events:subscribe" }
+  ]
 }
 ```
 
-Official marketplace lives at `stablyai/orca-plugins`. Listings that declare unsupported categories (including **skills**) are hidden from install until the marketplace catches up.
-
-**Conclusion:** do **not** block on becoming an Orca marketplace plugin for distribution. Ship as a **skill** (+ optional later UI plugin if we add a panel).
+**Conclusion:** distribute the **skill + CLI** first; keep the desktop plugin as a Start convenience that stays third-party-safe.
 
 ---
 
 ## 3. Desktop plugin (scaffolded in this repo)
 
-Files:
+Same roles as `hello-orca`, files under `plugin/`:
 
-- `orca-plugin.json` — manifest (`tungnguyentu.orca-ai-team`)
-- `plugin/main.mjs` — command worker: types `orca-team start …` into a worktree terminal
-- `plugin/panel.html` — right-sidebar panel with Start button
+- `orca-plugin.json` — manifest identity `tungnguyentu.orca-ai-team`
+- `plugin/main.mjs` — worker types `orca-team start …` via `terminal.sendText`; stores last terminal id
+- `plugin/panel.html` — paste terminal id + optional objective → send
 
-What it can do (Orca plugin host API v0):
+**Can:** palette commands, `Mod+Alt+A`, panel Start.  
+**Cannot (third-party):** auto-list terminals, create terminals. Needs `orca-team` on PATH.
 
-- Command palette: **AI Team: Start (same-tab)** / **… (tabs layout)**
-- Shortcut: `Mod+Alt+A` (worktree context)
-- Panel: paste terminal id + optional objective → send start command
+### Install
 
-What it **cannot** do yet: list worktree terminals automatically (third-party plugins cannot use `workspace:read`), or create a new terminal by itself (host API only has `terminal.sendText`). Paste an id from `orca terminal list --json`. Also requires `orca-team` on PATH (install the skill first).
-
-### Install the plugin in Orca
-
-Orca’s plugin system is still experimental. Typical paths:
-
-1. Open **Plugins** in the Orca app.
-2. Install from Git source: `https://github.com/tungnguyentu/orca-ai-team` (needs access if private), **or** install from a local folder / marketplace listing when available.
-3. Consent to capabilities: terminal send, notifications, storage, events (no `workspace:read` — blocked for third-party).
-
-Sideload for local testing (paths vary by Orca version): copy/link this repo under Orca’s user plugins directory if the UI offers “Install from folder”, or use the Plugins catalog “from Git” flow.
-
-After install, open a worktree shell and run **AI Team: Start (same-tab)** from the command palette, or use the **AI Team** sidebar panel.
+1. Orca → **Plugins** (experimental).
+2. Add from Git `https://github.com/tungnguyentu/orca-ai-team` or from folder — use **v0.3.4+**.
+3. Consent to terminal send / notifications / storage / events.
+4. `orca terminal list --json` → paste id in **AI Team** panel → Start (later shortcut reuses stored id).
 
 ---
 
